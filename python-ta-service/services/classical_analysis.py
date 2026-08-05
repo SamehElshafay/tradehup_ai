@@ -199,12 +199,14 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> dict:
     if last_rsi:
         if last_rsi >= 70:
             condition = "overbought"
-        elif last_rsi <= 30:
-            condition = "oversold"
-        elif last_rsi >= 60:
+        elif last_rsi > 55:
             condition = "bullish"
-        elif last_rsi <= 40:
+        elif last_rsi >= 45:
+            condition = "neutral"
+        elif last_rsi > 30:
             condition = "bearish"
+        else:
+            condition = "oversold"
 
     # RSI series for chart (last 50 values)
     rsi_series = []
@@ -630,74 +632,74 @@ def run_classical_analysis(df: pd.DataFrame) -> dict:
         + detect_triangles_and_wedges(df)
     )
 
-    # ── Bias scoring ─────────────────────────────────────────────────────────
-    # MA trend is the backbone signal — weighted higher than other indicators
-    bullish_signals = 0
-    bearish_signals = 0
+    # ── Continuous Bias Scoring (0 to 100) ───────────────────────────────────
+    # Weights for each indicator
+    w_ma = 0.35
+    w_rsi = 0.25
+    w_macd = 0.20
+    w_patterns = 0.20
 
+    # Scores range from -1.0 (strongly bearish) to +1.0 (strongly bullish)
+    score_ma = 0.0
+    score_rsi = 0.0
+    score_macd = 0.0
+    score_patterns = 0.0
+
+    # 1. MA Score
     trend = mas.get("trend", "neutral")
-    pve = mas.get("price_vs_emas", {})
-    below_count = pve.get("below_count", 0)
-    above_count = pve.get("above_count", 0)
+    if trend == "strong_uptrend": score_ma = 1.0
+    elif trend == "strong_downtrend": score_ma = -1.0
+    elif trend == "uptrend": score_ma = 0.5
+    elif trend == "downtrend": score_ma = -0.5
+    
+    # 2. RSI Score
+    curr_rsi = rsi.get("current")
+    if curr_rsi is not None:
+        if curr_rsi >= 70: score_rsi = 1.0
+        elif curr_rsi <= 30: score_rsi = -1.0
+        elif curr_rsi > 50: score_rsi = (curr_rsi - 50) / 20.0
+        elif curr_rsi < 50: score_rsi = (curr_rsi - 50) / 20.0
+        
+    # 3. MACD Score
+    hist = macd.get("histogram")
+    crossover = macd.get("crossover", "neutral")
+    if crossover == "bullish": score_macd += 0.5
+    elif crossover == "bearish": score_macd -= 0.5
+    if hist is not None:
+        if hist > 0: score_macd += 0.5
+        elif hist < 0: score_macd -= 0.5
 
-    if trend == "strong_downtrend":
-        bearish_signals += 5  # Below ALL 3 EMAs — dominant bearish signal
-    elif trend == "strong_uptrend":
-        bullish_signals += 5  # Above ALL 3 EMAs
-    elif trend == "downtrend":
-        bearish_signals += 3  # Below 2 of 3 EMAs
-    elif trend == "uptrend":
-        bullish_signals += 3
-
-    # RSI: in a strong downtrend, oversold is a LESS reliable reversal signal
-    # (price can stay oversold for extended periods in a downtrend)
-    rsi_condition = rsi.get("condition", "neutral")
-    if rsi_condition == "oversold":
-        if trend in ["strong_downtrend", "downtrend"]:
-            bullish_signals += 1   # Reduced from 2 — oversold in downtrend is a warning, not a signal
-        else:
-            bullish_signals += 2
-    elif rsi_condition == "overbought":
-        if trend in ["strong_uptrend", "uptrend"]:
-            bearish_signals += 1   # Overbought in uptrend is less significant
-        else:
-            bearish_signals += 2
-    elif rsi_condition == "bullish":
-        bullish_signals += 1
-    elif rsi_condition == "bearish":
-        bearish_signals += 1
-
-    if macd.get("crossover") == "bullish":
-        bullish_signals += 1
-    elif macd.get("crossover") == "bearish":
-        bearish_signals += 1
-
+    # 4. Patterns Score
+    bullish_p = 0
+    bearish_p = 0
     for p in candle_patterns:
-        if p["direction"] == "bullish":
-            bullish_signals += 1
-        elif p["direction"] == "bearish":
-            bearish_signals += 1
-
-    # Chart patterns (Double/Triple Top/Bottom, H&S, Triangles/Wedges) are a bigger
-    # structural signal than a single candlestick, so they carry more weight.
+        if p["direction"] == "bullish": bullish_p += 1
+        elif p["direction"] == "bearish": bearish_p += 1
     for p in chart_patterns:
-        if p["direction"] == "bullish":
-            bullish_signals += 2
-        elif p["direction"] == "bearish":
-            bearish_signals += 2
+        if p["direction"] == "bullish": bullish_p += 2
+        elif p["direction"] == "bearish": bearish_p += 2
+        
+    net_p = bullish_p - bearish_p
+    if net_p > 0: score_patterns = min(net_p / 3.0, 1.0)
+    elif net_p < 0: score_patterns = max(net_p / 3.0, -1.0)
 
-    total = bullish_signals + bearish_signals
-    confidence = 0
-    bias = "neutral"
-    if total > 0:
-        if bullish_signals > bearish_signals + 1:
-            bias = "bullish"
-            confidence = int((bullish_signals / total) * 100)
-        elif bearish_signals > bullish_signals + 1:
-            bias = "bearish"
-            confidence = int((bearish_signals / total) * 100)
-        else:
-            confidence = 50
+    # ── Final Calculation ──
+    total_score = (score_ma * w_ma) + (score_rsi * w_rsi) + (score_macd * w_macd) + (score_patterns * w_patterns)
+    
+    if total_score > 0.1:
+        bias = "bullish"
+        raw_conf = 50 + (abs(total_score) * 32)
+        confidence = int(min(82, round(raw_conf)))
+    elif total_score < -0.1:
+        bias = "bearish"
+        raw_conf = 50 + (abs(total_score) * 32)
+        confidence = int(min(82, round(raw_conf)))
+    else:
+        bias = "neutral"
+        confidence = 50
+
+    bullish_signals = int(bullish_p + (1 if score_ma > 0 else 0) + (1 if score_rsi > 0 else 0) + (1 if score_macd > 0 else 0))
+    bearish_signals = int(bearish_p + (1 if score_ma < 0 else 0) + (1 if score_rsi < 0 else 0) + (1 if score_macd < 0 else 0))
 
     return {
         "support_resistance": sr,

@@ -9,9 +9,13 @@ use App\Services\AgentBridgeService;
 use App\Http\Controllers\Api\SettingsController;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use App\Services\ChatToolService;
 
 class ChatController extends Controller {
-    public function __construct(private OpenRouterService $aiService) {}
+    public function __construct(
+        private OpenRouterService $aiService,
+        private ChatToolService $toolService
+    ) {}
 
     public function conversations(Request $request): JsonResponse {
         $conversations = $request->user()->chatConversations()->with('lastMessage')->latest()->get();
@@ -55,7 +59,38 @@ class ChatController extends Controller {
         $systemPrompt = $this->buildSystemPrompt();
         array_unshift($history, ['role' => 'system', 'content' => $systemPrompt]);
 
-        $aiResponse = $this->aiService->chatWithHistory($history);
+        $tools = $this->toolService->getToolDefinitions();
+        $aiResponse = $this->aiService->chatWithHistory($history, null, $tools);
+
+        // Tool Calling Loop (max 5 iterations to prevent infinite loops)
+        $iterations = 0;
+        while (is_array($aiResponse) && isset($aiResponse['tool_calls']) && $iterations < 5) {
+            $iterations++;
+            // Append the assistant's tool call request to the history
+            $history[] = $aiResponse;
+            
+            foreach ($aiResponse['tool_calls'] as $toolCall) {
+                $funcName = $toolCall['function']['name'];
+                $args = json_decode($toolCall['function']['arguments'], true) ?? [];
+                
+                $result = $this->toolService->executeToolCall($funcName, $args, $request->user()->id);
+                
+                $history[] = [
+                    'role' => 'tool',
+                    'tool_call_id' => $toolCall['id'],
+                    'name' => $funcName,
+                    'content' => $result
+                ];
+            }
+            
+            // Send the updated history back to the LLM to get the final answer
+            $aiResponse = $this->aiService->chatWithHistory($history, null, $tools);
+        }
+
+        // Fallback if it returned an array without tool calls (or max iterations reached)
+        if (is_array($aiResponse)) {
+            $aiResponse = $aiResponse['content'] ?? 'An error occurred during tool execution.';
+        }
 
         $aiMessage = ChatMessage::create([
             'conversation_id' => $conversation->id,
@@ -182,11 +217,12 @@ class ChatController extends Controller {
             . "- الإجابة على الأسئلة الخاصة بالتوصيات المعروضة (Entry/TP/SL) وتوضيح سبب الأرقام بناءً على المؤشرات المحسوبة.\n"
             . "- شرح المفاهيم الفنية واستراتيجيات التداول المختلفة.\n\n"
             . "قواعد الرد:\n"
-            . "1. لا ترد برفض عام مثل 'لا أستطيع تقديم نصيحة مالية' — قدم تحليلاً فنياً مبنياً على البيانات.\n"
-            . "2. إذا سألك المستخدم 'أشتري أم لا؟'، أجب بالبيانات: 'بناءً على [المؤشرات المحسوبة]، الاتجاه الحالي هو [كذا]، والقرار النهائي وإدارة المخاطر تظل مسؤوليتك'.\n"
-            . "3. تجنب التأكيدات المطلقة مثل 'أضمن لك'، وقدم تحليلاً واضحاً وموضوعياً بدلاً من الرفض الفاضي.\n"
-            . "4. أجب دائماً بنوع اللغة التي يكتب بها المستخدم (عربي / إنجليزي).\n"
-            . "5. CRITICAL: Never output any Chinese characters or Asian symbols. Use ONLY Arabic and English.\n"
+            . "1. لديك أدوات (Tools/Functions) مبرمجة لجلب الأسعار الحية، وعمل التحليل الفني، وجلب بيانات الصفقات. **استخدمها دائماً** عندما يسألك المستخدم عن أسعار أو تحليل أو صفقات، وإياك أن تقول 'لا أستطيع الوصول للبيانات الحية'.\n"
+            . "2. لا ترد برفض عام مثل 'لا أستطيع تقديم نصيحة مالية' — قدم تحليلاً فنياً مبنياً على البيانات عبر استخدام أدواتك.\n"
+            . "3. إذا سألك المستخدم 'أشتري أم لا؟'، قم باستدعاء أداة التحليل الفني، ثم أجب بالبيانات: 'بناءً على [المؤشرات المحسوبة]، الاتجاه الحالي هو [كذا]، والقرار النهائي وإدارة المخاطر تظل مسؤوليتك'.\n"
+            . "4. تجنب التأكيدات المطلقة مثل 'أضمن لك'، وقدم تحليلاً واضحاً وموضوعياً.\n"
+            . "5. أجب دائماً بنوع اللغة التي يكتب بها المستخدم (عربي / إنجليزي).\n"
+            . "6. CRITICAL: Never output any Chinese characters or Asian symbols. Use ONLY Arabic and English.\n"
             . "الوقت الحالي: " . now()->toDateTimeString();
     }
 }

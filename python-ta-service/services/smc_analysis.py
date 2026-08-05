@@ -80,7 +80,19 @@ def detect_bos_choch(df: pd.DataFrame) -> dict:
                 "description": "Change of Character — Potential Reversal to Downside"
             })
 
+    trend = "ranging"
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        last_sh = swing_highs[-1]
+        prev_sh = swing_highs[-2]
+        last_sl = swing_lows[-1]
+        prev_sl = swing_lows[-2]
+        if last_sh["price"] > prev_sh["price"] and last_sl["price"] > prev_sl["price"]:
+            trend = "bullish"
+        elif last_sh["price"] < prev_sh["price"] and last_sl["price"] < prev_sl["price"]:
+            trend = "bearish"
+
     return {
+        "trend": trend,
         "swing_highs": swing_highs[-5:],
         "swing_lows": swing_lows[-5:],
         "bos": bos_events,

@@ -11,6 +11,8 @@ use App\Services\OpenRouterService;
 use App\Services\CryptoPanicService;
 use App\Services\WhaleAlertService;
 use App\Services\AgentBridgeService;
+use App\Services\PreTradeFilterService;
+use App\Services\AmdCycleService;
 use App\Http\Controllers\Api\SettingsController;
 use App\Events\MarketScanProgress;
 use Illuminate\Http\Request;
@@ -21,10 +23,12 @@ use Illuminate\Support\Facades\Cache;
 class AnalysisController extends Controller
 {
     public function __construct(
-        private PythonTAService    $taService,
-        private OpenRouterService  $aiService,
-        private CryptoPanicService $newsService,
-        private WhaleAlertService  $whaleService,
+        private PythonTAService       $taService,
+        private OpenRouterService     $aiService,
+        private CryptoPanicService    $newsService,
+        private WhaleAlertService     $whaleService,
+        private PreTradeFilterService $preTradeFilter,
+        private AmdCycleService       $amdCycleService,
     ) {}
 
     public function analyze(Request $request, string $symbol, string $timeframe): JsonResponse
@@ -46,6 +50,12 @@ class AnalysisController extends Controller
             $mtfActive = $htfTf && $mtfTf && $ltfTf
                 && $htfTf !== $mtfTf && $mtfTf !== $ltfTf && $htfTf !== $ltfTf;
 
+            if ($mtfActive) {
+                // Strict enforce MTF structure: ignore the single clicked timeframe from the UI route
+                // and use the configured LTF as the base entry timeframe.
+                $timeframe = $ltfTf;
+            }
+
             $exchange = $coin->exchange ?? 'binance';
 
             if ($isAutoScan) event(new MarketScanProgress("Fetching exchange data for {$symbol}...", 'info', $symbol));
@@ -62,6 +72,10 @@ class AnalysisController extends Controller
                 $htfData = $this->taService->analyze($symbol, $exchange, $htfTf);
                 $mtfData = $this->taService->analyze($symbol, $exchange, $mtfTf);
                 $ltfTf   = $timeframe; // The clicked timeframe is the LTF entry timeframe
+                
+                // Inject into taData so it's saved in the raw_data JSON for the report
+                $taData['htf_data'] = $htfData;
+                $taData['mtf_data'] = $mtfData;
             }
 
             if ($isAutoScan) {
@@ -70,6 +84,15 @@ class AnalysisController extends Controller
                 $mode  = $mtfActive ? "[MTF: {$htfTf}→{$mtfTf}→{$timeframe}]" : "[Single TF]";
                 event(new MarketScanProgress("Technical Analysis complete {$mode}. RSI: {$rsi} | Bias: {$trend}", 'info', $symbol));
             }
+
+            // Update coin's volume_24h and price if available
+            if (isset($taData['volume_24h'])) {
+                $coin->volume_24h = $taData['volume_24h'];
+            }
+            if (isset($taData['current_price'])) {
+                $coin->current_price = $taData['current_price'];
+            }
+            $coin->save();
 
             // ── Step 2: Save primary (LTF) analysis to DB ─────────────────────
             $analysis = Analysis::create([
@@ -104,66 +127,182 @@ class AnalysisController extends Controller
                 event(new MarketScanProgress($msg, 'warning', $symbol));
             }
 
-            // ── Step 4: Build AI payload ──────────────────────────────────────
-            if ($isAutoScan) {
-                $mode = $mtfActive ? "[MTF Top-Down: {$htfTf}→{$mtfTf}→{$timeframe}]" : "[Single TF]";
-                event(new MarketScanProgress("Sending data to Deep AI Engine {$mode}...", 'info', $symbol));
-            }
-
-            $aiData = array_merge($taData, [
-                'news_sentiment' => $sentimentScore,
-                'whale_activity' => $relevantWhales,
-                'is_trending'    => $request->boolean('is_trending', false),
-            ]);
-
-            $aiProvider = $settings['ai_provider'] ?? '';
-
-            // ── Step 5: Build prompt (MTF or single-TF) ───────────────────────
-            if ($mtfActive) {
-                $prompt = $this->aiService->buildMtfTradingPrompt(
-                    $htfData, $htfTf,
-                    $mtfData, $mtfTf,
-                    $taData,  $timeframe,
-                    $symbol,  $settings
-                );
-            } else {
-                $prompt = $this->aiService->buildTradingPrompt($aiData, $symbol, $timeframe, $settings);
-            }
-
-            // ── Step 5.5: Antigravity bridge path ─────────────────────────────
-            if ($aiProvider === 'antigravity') {
-                $bridge = new AgentBridgeService($settings);
-                if (!$bridge->isConfigured()) {
-                    return response()->json(['message' => 'Antigravity bridge folder is not configured in settings.'], 400);
+            if ($isAutoScan) event(new MarketScanProgress("Scanning for recent specific news on {$symbol}...", 'info', $symbol));
+            $specificNews = $this->newsService->getCoinSpecificNews($symbol);
+            if (!empty($specificNews)) {
+                if (!isset($taData['confluences'])) {
+                    $taData['confluences'] = [];
                 }
-
-                $systemPrompt = 'You are an expert crypto trading analyst. Always respond with valid JSON only. No markdown. No explanation.';
-                $requestId    = $bridge->submitRequest(
-                    type: 'analysis',
-                    input: ['prompt' => $prompt],
-                    promptContext: $systemPrompt
-                );
-
-                Cache::put("analysis_context_{$requestId}", [
-                    'taData'         => $taData,
-                    'sentimentScore' => $sentimentScore,
-                    'relevantWhales' => $relevantWhales,
-                    'mtf_active'     => $mtfActive,
-                    'htf_tf'         => $htfTf,
-                    'mtf_tf'         => $mtfTf,
-                ], now()->addMinutes(15));
-
-                return response()->json([
-                    'bridge_pending' => true,
-                    'request_id'     => $requestId,
-                    'message'        => 'Analysis queued for Antigravity AI.',
+                foreach ($specificNews as $article) {
+                    $taData['confluences'][] = "📰 24h News: [".ucfirst($article['sentiment'])."] " . $article['title'];
+                }
+                // Store structured news in raw_data so reportGenerator can read it
+                $taData['specific_news'] = $specificNews;
+                $analysis->update([
+                    'raw_data'    => $taData,
+                    'confluences' => $taData['confluences']
                 ]);
             }
 
-            // ── Standard synchronous path ─────────────────────────────────────
-            // Call AI with the pre-built prompt directly
-            $aiResult = $this->aiService->generateRecommendationFromPrompt($prompt, $settings);
-            $aiResult = $this->validateAndClampRecommendation($aiResult, $taData, $timeframe);
+            // ── Step 3.5: Session Context ─────────────────────────────────────
+            $sessionContext = $this->buildSessionContext();
+            $taData['session_context'] = $sessionContext;
+
+            if ($isAutoScan && $sessionContext['is_noisy']) {
+                event(new MarketScanProgress(
+                    "⏰ Session Warning: " . $sessionContext['session_alert'] . " — AI is aware.",
+                    'warning',
+                    $symbol
+                ));
+            }
+
+            // ── Step 3.55: AMD Cycle Analysis (Accumulation-Manipulation-Distribution) ──
+            // Purely additive — a coin with no valid accumulation zone or no manipulation
+            // detected simply gets status 'no_data'/'no_manipulation' and everything else
+            // (prompt, filters, report) proceeds exactly as it would without this layer.
+            $atrForAmd  = (float) ($taData['classical']['atr']['current'] ?? 0);
+            $amdAnalysis = $this->amdCycleService->analyze($symbol, $exchange, $atrForAmd, $settings);
+            $taData['amd_analysis'] = $amdAnalysis;
+
+            if ($isAutoScan && $amdAnalysis['manipulation_detected']) {
+                event(new MarketScanProgress(
+                    "🎯 AMD Cycle: " . $amdAnalysis['summary'],
+                    'warning',
+                    $symbol
+                ));
+            }
+
+            // ── Step 3.6: Pre-Trade Filters ───────────────────────────────────
+            if ($isAutoScan) event(new MarketScanProgress("Running pre-trade quality filters...", 'info', $symbol));
+
+            $filterResult = $this->preTradeFilter->run($taData, $settings);
+
+            // Inject filter warnings into confluences so the AI prompt sees them
+            if (!empty($filterResult['warnings'])) {
+                $taData['confluences'] = array_merge($taData['confluences'] ?? [], $filterResult['warnings']);
+            }
+
+            // Store filter result and updated data in raw_data for the report
+            $taData['pre_trade_filter'] = $filterResult;
+            $analysis->update(['confluences' => $taData['confluences'], 'raw_data' => $taData]);
+
+            if ($isAutoScan && $filterResult['pre_trade_verdict'] === 'WAIT') {
+                event(new MarketScanProgress(
+                    "Pre-Trade Filter → WAIT: " . ($filterResult['pre_trade_reason'] ?? 'Quality gate not met.'),
+                    'warning',
+                    $symbol
+                ));
+            }
+
+            // ── Step 3.7: Skip the AI call entirely on a deterministic filter WAIT ──
+            // When enabled, a pre-trade filter WAIT is never sent to the AI — it would
+            // just get overridden back to WAIT by applyPreTradeFilterOverride() below,
+            // so calling the AI first only burns tokens for a discarded result.
+            $skipAiOnWait = (bool) ($settings['skip_ai_on_filter_wait'] ?? false);
+            $aiProvider   = $settings['ai_provider'] ?? '';
+
+            if ($skipAiOnWait && ($filterResult['pre_trade_verdict'] ?? 'PROCEED') === 'WAIT') {
+                if ($isAutoScan) {
+                    event(new MarketScanProgress(
+                        "Pre-Trade Filter → WAIT. Skipping AI call to save tokens (skip_ai_on_filter_wait is on).",
+                        'warning',
+                        $symbol
+                    ));
+                }
+
+                $aiResult = [
+                    'action'       => 'WAIT',
+                    'entry_price'  => $taData['current_price'] ?? null,
+                    'tp1'          => null,
+                    'tp2'          => null,
+                    'tp3'          => null,
+                    'sl'           => null,
+                    'risk_reward'  => 'N/A',
+                    'confidence'   => $filterResult['adjusted_confidence'] ?? 0,
+                    'reasoning'    => '[Pre-Trade Filter: ' . ($filterResult['pre_trade_reason'] ?? 'Quality gate not met.') . '] (AI call skipped to save tokens)',
+                    'confluences'  => $taData['confluences'] ?? [],
+                    'invalidation' => null,
+                    'sl_auto_widened' => false,
+                ];
+            } else {
+                // ── Step 4: Build AI payload ──────────────────────────────────────
+                if ($isAutoScan) {
+                    $mode = $mtfActive ? "[MTF Top-Down: {$htfTf}→{$mtfTf}→{$timeframe}]" : "[Single TF]";
+                    event(new MarketScanProgress("Sending data to Deep AI Engine {$mode}...", 'info', $symbol));
+                }
+
+                $aiData = array_merge($taData, [
+                    'news_sentiment'       => $sentimentScore,
+                    'whale_activity'       => $relevantWhales,
+                    'specific_news'        => $specificNews,
+                    'is_trending'          => $request->boolean('is_trending', false),
+                    'pre_trade_filter'     => $filterResult,
+                    'session_context'      => $sessionContext,
+                    'amd_analysis'         => $amdAnalysis,
+                ]);
+
+                // ── Step 5: Build prompt (MTF or single-TF) ───────────────────────
+                if ($mtfActive) {
+                    $prompt = $this->aiService->buildMtfTradingPrompt(
+                        $htfData, $htfTf,
+                        $mtfData, $mtfTf,
+                        $aiData,  $timeframe,
+                        $symbol,  $settings
+                    );
+                } else {
+                    $prompt = $this->aiService->buildTradingPrompt($aiData, $symbol, $timeframe, $settings);
+                }
+
+                // ── Step 5.5: Antigravity bridge path ─────────────────────────────
+                if ($aiProvider === 'antigravity') {
+                    $bridge = new AgentBridgeService($settings);
+                    if (!$bridge->isConfigured()) {
+                        return response()->json(['message' => 'Antigravity bridge folder is not configured in settings.'], 400);
+                    }
+
+                    $systemPrompt = 'You are an expert crypto trading analyst. Always respond with valid JSON only. No markdown. No explanation.';
+                    $requestId    = $bridge->submitRequest(
+                        type: 'analysis',
+                        input: ['prompt' => $prompt],
+                        promptContext: $systemPrompt
+                    );
+
+                    Cache::put("analysis_context_{$requestId}", [
+                        'taData'         => $taData,
+                        'sentimentScore' => $sentimentScore,
+                        'relevantWhales' => $relevantWhales,
+                        'mtf_active'     => $mtfActive,
+                        'htf_tf'         => $htfTf,
+                        'mtf_tf'         => $mtfTf,
+                        'ltf_tf'         => $ltfTf,
+                        'filter_result'  => $filterResult,
+                    ], now()->addMinutes(15));
+
+                    return response()->json([
+                        'bridge_pending' => true,
+                        'request_id'     => $requestId,
+                        'message'        => 'Analysis queued for Antigravity AI.',
+                    ]);
+                }
+
+                // ── Standard synchronous path ─────────────────────────────────────
+                // Call AI with the pre-built prompt directly
+                $aiResult = $this->aiService->generateRecommendationFromPrompt($prompt, $settings);
+                $aiResult = $this->validateAndClampRecommendation($aiResult, $taData, $timeframe);
+
+                // ── Pre-Trade Filter Hard Override ────────────────────────────────
+                // Even if the AI says BUY/SELL, the filter verdict can force WAIT.
+                $aiResult = $this->applyPreTradeFilterOverride($aiResult, $filterResult);
+            }
+
+            // ⚡ DETERMINISM FIX — Layer 3: Consistency check
+            // Compare this result with the last signal for the same symbol/TF.
+            // Injects a warning if the action changed within 5 minutes and price barely moved (< 0.1%).
+            $currentPrice = (float)($taData['current_price'] ?? 0);
+            $consistencyWarning = $this->checkConsistency($symbol, $timeframe, $currentPrice, $aiResult);
+            if ($consistencyWarning) {
+                $aiResult['reasoning'] = trim(($aiResult['reasoning'] ?? '') . " {$consistencyWarning}");
+            }
 
             if ($isAutoScan) {
                 $aiAction  = is_array($aiResult['action'] ?? null)     ? json_encode($aiResult['action'])     : ($aiResult['action'] ?? 'WAIT');
@@ -198,6 +337,7 @@ class AnalysisController extends Controller
                 'sentiment_score' => $sentimentScore,
                 'whale_activity'  => $relevantWhales,
                 'ai_model'        => $aiProvider === 'antigravity' ? 'Antigravity AI' : ($settings['analysis_model'] ?? env('OPENROUTER_DEFAULT_MODEL')),
+                'strategy'        => $request->input('strategy'),
                 'mtf_mode'        => $mtfActive,
                 'mtf_timeframes'  => $mtfActive ? "{$htfTf}→{$mtfTf}→{$timeframe}" : null,
                 'status'          => 'active',
@@ -210,13 +350,21 @@ class AnalysisController extends Controller
 
             $coin->update(['current_price' => $taData['current_price'] ?? $coin->current_price]);
 
+            // Append ATR/SL gate metadata to the recommendation for the frontend
+            // (not stored in DB — returned in-memory for this response only)
+            $recommendationData = $recommendation->toArray();
+            $recommendationData['sl_auto_widened'] = $aiResult['sl_auto_widened'] ?? false;
+            $recommendationData['sl_original']     = $aiResult['sl_original']     ?? null;
+            $recommendationData['sl_min_atr_dist'] = $aiResult['sl_min_atr_dist'] ?? null;
+
             return response()->json([
-                'analysis'        => $analysis,
-                'recommendation'  => $recommendation,
-                'chart_overlays'  => $taData['chart_overlays'] ?? [],
-                'candles'         => $taData['candles'] ?? [],
-                'mtf_active'      => $mtfActive,
-                'mtf_timeframes'  => $mtfActive ? "{$htfTf}→{$mtfTf}→{$timeframe}" : null,
+                'analysis'           => $analysis,
+                'recommendation'     => $recommendationData,
+                'chart_overlays'     => $taData['chart_overlays'] ?? [],
+                'candles'            => $taData['candles'] ?? [],
+                'mtf_active'         => $mtfActive,
+                'mtf_timeframes'     => $mtfActive ? "{$htfTf}→{$mtfTf}→{$timeframe}" : null,
+                'consistency_warning'=> $consistencyWarning ?? null,
             ]);
 
         } catch (\Exception $e) {
@@ -257,13 +405,20 @@ class AnalysisController extends Controller
                 $mtfActive      = $cachedContext['mtf_active'] ?? false;
                 $htfTf          = $cachedContext['htf_tf'] ?? null;
                 $mtfTf          = $cachedContext['mtf_tf'] ?? null;
+                $ltfTf          = $cachedContext['ltf_tf'] ?? $timeframe;
 
                 $coin = Coin::where('symbol', $symbol)->firstOrFail();
                 $isAutoScan = $request->boolean('is_trending', false);
 
                 // Re-run validation and saving logic
                 $aiResult = $this->validateAndClampRecommendation($aiResult, $taData, $timeframe);
-                
+
+                // Apply pre-trade filter override (loaded from cache)
+                $cachedFilterResult = $cachedContext['filter_result'] ?? null;
+                if ($cachedFilterResult) {
+                    $aiResult = $this->applyPreTradeFilterOverride($aiResult, $cachedFilterResult);
+                }
+
                 if ($isAutoScan) {
                     $aiAction = is_array($aiResult['action'] ?? null) ? json_encode($aiResult['action']) : ($aiResult['action'] ?? 'WAIT');
                     $aiConf = is_array($aiResult['confidence'] ?? null) ? json_encode($aiResult['confidence']) : ($aiResult['confidence'] ?? 0);
@@ -274,7 +429,7 @@ class AnalysisController extends Controller
 
                 $analysis = Analysis::create([
                     'coin_id'              => $coin->id,
-                    'timeframe'            => $timeframe,
+                    'timeframe'            => $ltfTf,
                     'raw_data'             => $taData,
                     'classical_data'       => $taData['classical'] ?? null,
                     'smc_data'             => $taData['smc'] ?? null,
@@ -295,7 +450,7 @@ class AnalysisController extends Controller
                 $recommendation = Recommendation::create([
                     'coin_id'         => $coin->id,
                     'analysis_id'     => $analysis->id,
-                    'timeframe'       => $timeframe,
+                    'timeframe'       => $ltfTf,
                     'action'          => $aiResult['action'] ?? 'WAIT',
                     'entry_price'     => $aiResult['entry_price'] ?? $taData['current_price'],
                     'tp1'             => $aiResult['tp1'] ?? null,
@@ -310,8 +465,9 @@ class AnalysisController extends Controller
                     'sentiment_score' => $sentimentScore,
                     'whale_activity'  => $relevantWhales,
                     'ai_model'        => 'Antigravity AI',
+                    'strategy'        => $request->input('strategy'),
                     'mtf_mode'        => $mtfActive,
-                    'mtf_timeframes'  => $mtfActive ? "{$htfTf}→{$mtfTf}→{$timeframe}" : null,
+                    'mtf_timeframes'  => $mtfActive ? "{$htfTf}→{$mtfTf}→{$ltfTf}" : null,
                     'status'          => 'active',
                     'expires_at'      => now()->addHours($this->getExpiryHours($timeframe)),
                 ]);
@@ -324,14 +480,20 @@ class AnalysisController extends Controller
 
                 Cache::forget("analysis_context_{$requestId}");
 
+                // Append ATR/SL gate metadata to the recommendation for the frontend
+                $bridgeRecData = $recommendation->toArray();
+                $bridgeRecData['sl_auto_widened'] = $aiResult['sl_auto_widened'] ?? false;
+                $bridgeRecData['sl_original']     = $aiResult['sl_original']     ?? null;
+                $bridgeRecData['sl_min_atr_dist'] = $aiResult['sl_min_atr_dist'] ?? null;
+
                 return response()->json([
                     'status'         => 'completed',
                     'analysis'       => $analysis,
-                    'recommendation' => $recommendation,
+                    'recommendation' => $bridgeRecData,
                     'chart_overlays' => $taData['chart_overlays'] ?? [],
                     'candles'        => $taData['candles'] ?? [],
                     'mtf_active'     => $mtfActive,
-                    'mtf_timeframes' => $mtfActive ? "{$htfTf}→{$mtfTf}→{$timeframe}" : null,
+                    'mtf_timeframes' => $mtfActive ? "{$htfTf}→{$mtfTf}→{$ltfTf}" : null,
                 ]);
             } catch (\Exception $e) {
                 Log::error('Bridge Analysis failed', ['symbol' => $symbol, 'error' => $e->getMessage()]);
@@ -347,10 +509,13 @@ class AnalysisController extends Controller
         $symbol = strtoupper($symbol);
         $coin   = Coin::where('symbol', $symbol)->firstOrFail();
 
-        $analysis = Analysis::where('coin_id', $coin->id)
-            ->where('timeframe', $timeframe)
-            ->latest('analyzed_at')
-            ->first();
+        $query = Analysis::where('coin_id', $coin->id);
+        
+        if ($timeframe !== 'all') {
+            $query->where('timeframe', $timeframe);
+        }
+        
+        $analysis = $query->latest('analyzed_at')->first();
 
         if (!$analysis) {
             return response()->json(['message' => 'No analysis found. Run analysis first.'], 404);
@@ -363,6 +528,66 @@ class AnalysisController extends Controller
             'recommendation' => $recommendation,
             'chart_overlays' => $analysis->chart_overlays ?? [],
         ]);
+    }
+
+    /**
+     * Compute current trading session context based on UTC time.
+     * Returns session names, overlap flags, and whether conditions are noisy/low-liquidity.
+     */
+    private function buildSessionContext(): array
+    {
+        $utcH = (int) gmdate('G');
+        $utcM = (int) gmdate('i');
+        $utcDecimal = $utcH + $utcM / 60;
+
+        $activeSessions = [];
+        if ($utcDecimal >= 0  && $utcDecimal < 9)  $activeSessions[] = 'Asian';
+        if ($utcDecimal >= 7  && $utcDecimal < 16) $activeSessions[] = 'London';
+        if ($utcDecimal >= 12 && $utcDecimal < 21) $activeSessions[] = 'New York';
+
+        $londonNyOverlap   = $utcDecimal >= 12 && $utcDecimal < 16;
+        $asiaLondonOverlap = $utcDecimal >= 7  && $utcDecimal < 9;
+        $isDeadZone        = $utcDecimal >= 21 || $utcDecimal < 0;
+
+        // Noisy: session open first hour or dead zone
+        $isAsiaOpen    = $utcDecimal >= 0  && $utcDecimal < 1;
+        $isLondonOpen  = $utcDecimal >= 7  && $utcDecimal < 8;
+        $isNyOpen      = $utcDecimal >= 12 && $utcDecimal < 13;
+        $isNoisy       = $isDeadZone || $isAsiaOpen || $isLondonOpen || $isNyOpen;
+
+        $sessionAlert = '';
+        $tradeFilter  = 'PROCEED';
+
+        if ($londonNyOverlap) {
+            $sessionAlert = 'London–NY Overlap (12:00–16:00 UTC) — highest liquidity. Best for breakouts.';
+            $tradeFilter  = 'OPTIMAL';
+        } elseif ($asiaLondonOverlap) {
+            $sessionAlert = 'Asia–London transition (07:00–09:00 UTC) — stop-hunt candles common. Wait 30m.';
+            $tradeFilter  = 'CAUTION';
+        } elseif ($isDeadZone) {
+            $sessionAlert = 'Post-NY Dead Zone (21:00–00:00 UTC) — very low liquidity. Avoid new entries.';
+            $tradeFilter  = 'AVOID';
+        } elseif ($isAsiaOpen) {
+            $sessionAlert = 'Asia Open (00:00–01:00 UTC) — initial volatility spike. Wait for direction.';
+            $tradeFilter  = 'CAUTION';
+        } elseif ($isLondonOpen) {
+            $sessionAlert = 'London Open (07:00–08:00 UTC) — stop-hunt wicks common. Wait for confirmation.';
+            $tradeFilter  = 'CAUTION';
+        } elseif ($isNyOpen) {
+            $sessionAlert = 'NY Open (12:00–13:00 UTC) — high volatility. Wait 30m for direction.';
+            $tradeFilter  = 'CAUTION';
+        }
+
+        return [
+            'utc_time'           => gmdate('H:i') . ' UTC',
+            'active_sessions'    => empty($activeSessions) ? ['Off-hours'] : $activeSessions,
+            'london_ny_overlap'  => $londonNyOverlap,
+            'asia_london_overlap'=> $asiaLondonOverlap,
+            'is_dead_zone'       => $isDeadZone,
+            'is_noisy'           => $isNoisy,
+            'session_alert'      => $sessionAlert,
+            'trade_filter'       => $tradeFilter,
+        ];
     }
 
     private function calculateSentimentScore(array $news, string $symbol): float
@@ -386,6 +611,44 @@ class AnalysisController extends Controller
     {
         $baseAsset = str_replace('USDT', '', $symbol);
         return array_values(array_filter($whales, fn($w) => strtoupper($w['symbol'] ?? '') === $baseAsset));
+    }
+
+    /**
+     * Hard-override the AI result if the pre-trade filter says WAIT.
+     * Lowers confidence to the adjusted score and clears trade levels.
+     */
+    private function applyPreTradeFilterOverride(array $aiResult, array $filterResult): array
+    {
+        // Always apply the penalty-adjusted confidence — even on PROCEED
+        $adjustedConfidence = $filterResult['adjusted_confidence'] ?? null;
+        if ($adjustedConfidence !== null && isset($aiResult['confidence'])) {
+            // Use whichever is lower: AI reported or filter-adjusted
+            $aiResult['confidence'] = min((int) $aiResult['confidence'], (int) $adjustedConfidence);
+        }
+
+        if (($filterResult['pre_trade_verdict'] ?? 'PROCEED') !== 'WAIT') {
+            return $aiResult;
+        }
+
+        // AI wanted BUY/SELL but filter says WAIT — override
+        if (in_array($aiResult['action'] ?? '', ['BUY', 'SELL'])) {
+            $reason = $filterResult['pre_trade_reason'] ?? 'Pre-trade filter quality gate not met.';
+            Log::info('Pre-Trade Filter hard-override: AI action downgraded to WAIT', [
+                'original_action' => $aiResult['action'],
+                'filter_reason'   => $reason,
+            ]);
+            $aiResult['action']     = 'WAIT';
+            $aiResult['tp1']        = null;
+            $aiResult['tp2']        = null;
+            $aiResult['tp3']        = null;
+            $aiResult['sl']         = null;
+            $aiResult['risk_reward']= 'N/A';
+            $aiResult['confidence'] = $filterResult['adjusted_confidence'] ?? 0;
+            $aiResult['reasoning']  = trim(($aiResult['reasoning'] ?? '') .
+                " [Pre-Trade Filter Override: {$reason}]");
+        }
+
+        return $aiResult;
     }
 
     /**
@@ -432,7 +695,13 @@ class AnalysisController extends Controller
         $currentPrice = (float) ($taData['current_price'] ?? 0);
         if ($currentPrice <= 0) return $aiResult;
 
-        // ── Guard: If current price is INSIDE a Bearish OB, never allow BUY ──
+        // ── Guard: price INSIDE a Bearish OB — penalize, don't hard-block BUY ──
+        // Used to force WAIT outright. A real-data check (python-ta-service/services/
+        // ob_rule_validator.py, 747 bullish signals / 5 symbols) found the real win
+        // rate inside a bearish OB (94.7%, n=57 resolved) was statistically the same
+        // as outside one (96.7%, n=395 resolved) once the tuned TP/SL/expiry from
+        // trade_optimizer.py are used — the hard block was rejecting winners at the
+        // same rate as losers. Downgraded to a modest confidence penalty instead.
         if ($action === 'BUY') {
             $orderBlocks = $taData['smc']['order_blocks'] ?? [];
             foreach ($orderBlocks as $ob) {
@@ -440,22 +709,16 @@ class AnalysisController extends Controller
                     $bottom = (float) ($ob['bottom'] ?? 0);
                     $top    = (float) ($ob['top']    ?? 0);
                     if ($bottom > 0 && $top > 0 && $currentPrice >= $bottom && $currentPrice <= $top) {
-                        Log::info('BUY downgraded to WAIT: price is inside a Bearish Order Block', [
+                        Log::info('BUY confidence penalized: price is inside a Bearish Order Block', [
                             'symbol' => $taData['symbol'] ?? '?',
                             'price'  => $currentPrice,
                             'ob_bottom' => $bottom,
                             'ob_top'    => $top,
                         ]);
-                        $aiResult['action']     = 'WAIT';
-                        $aiResult['tp1']        = null;
-                        $aiResult['tp2']        = null;
-                        $aiResult['tp3']        = null;
-                        $aiResult['sl']         = null;
-                        $aiResult['risk_reward']= 'N/A';
-                        $aiResult['confidence'] = 0;
+                        $aiResult['confidence'] = max(0, (int) ($aiResult['confidence'] ?? 0) - 10);
                         $aiResult['reasoning']  = trim(($aiResult['reasoning'] ?? '') .
-                            " [Auto-downgraded: Price (\${$currentPrice}) is inside a Bearish Order Block (\${$bottom}–\${$top}), a high-probability supply/rejection zone. Entry risk is extreme.]");
-                        return $aiResult;
+                            " [Note: Price (\${$currentPrice}) is inside a Bearish Order Block (\${$bottom}–\${$top}) — confidence penalized 10%, not auto-rejected (real-data check found no significant win-rate difference here).]");
+                        break;
                     }
                 }
             }
@@ -528,21 +791,87 @@ class AnalysisController extends Controller
             $sl = min($sl, $ceiling);
         }
 
-        // 3. Recalculate R:R mathematically using TP2 as primary target
+        // 3. ATR/SL Backend Validation (Layer 2 of SL protection)
+        // ── The Pre-Trade filter (Layer 1) already blocked trades where ATR data was
+        //    clearly insufficient. Here we validate the ACTUAL SL the AI returned.
+        //    If the AI's SL is tighter than 1.5× ATR, we AUTO-WIDEN it to the minimum
+        //    safe distance rather than silently passing a stop-hunt trade.
+        $atrValue = (float) ($taData['classical']['atr']['current'] ?? 0);
+        $aiResult['sl_auto_widened'] = false;
+        if ($atrValue > 0 && $sl !== null && $entry > 0) {
+            $minSlDistance = $atrValue * 1.5;
+            $actualSlDistance = abs($entry - $sl);
+
+            if ($actualSlDistance < $minSlDistance) {
+                $originalSl   = $sl;
+                $wideSl       = ($action === 'BUY')
+                    ? round($entry - $minSlDistance, 8)
+                    : round($entry + $minSlDistance, 8);
+
+                Log::info('ATR/SL Gate: AI SL too tight — auto-widened', [
+                    'symbol'          => $taData['symbol'] ?? '?',
+                    'action'          => $action,
+                    'entry'           => $entry,
+                    'original_sl'     => $originalSl,
+                    'widened_sl'      => $wideSl,
+                    'atr'             => $atrValue,
+                    'min_sl_distance' => $minSlDistance,
+                    'actual_distance' => $actualSlDistance,
+                ]);
+
+                $sl = $wideSl;
+                $aiResult['sl_auto_widened']  = true;
+                $aiResult['sl_original']      = round($originalSl, 8);
+                $aiResult['sl_min_atr_dist']  = round($minSlDistance, 8);
+                $aiResult['reasoning'] = trim(($aiResult['reasoning'] ?? '') .
+                    " [⚠️ SL معدّل تلقائياً: SL الأصلي (" . round($originalSl, 8) . ") كان أضيق من 1.5× ATR (" . round($minSlDistance, 8) . "). تم التوسيع إلى " . round($wideSl, 8) . " لتجنب stop-hunt.]");
+            }
+        }
+
+        // 4. Recalculate R:R mathematically using TP2 as primary target
         $risk = abs($entry - $sl);
         $reward = ($tp2 !== null) ? abs($tp2 - $entry) : 0;
         $rrValue = ($risk > 0) ? round($reward / $risk, 2) : 0;
         $riskReward = "1:{$rrValue}";
 
-        // 4. If R:R below the configured minimum after clamping, downgrade to WAIT
+        // 5. If R:R below the configured minimum after clamping—
+        //    ⚡ DETERMINISM FIX (Layer 2): instead of immediately downgrading to WAIT
+        //    (which caused identical market conditions to produce SELL one run and WAIT another
+        //    just because the AI chose slightly different TP numbers), we first try to
+        //    recompute TP/SL deterministically from real S/R + OB + ATR data.
+        //    Only fall through to WAIT if even the deterministic fallback can't achieve minRR.
         if ($rrValue < $minRiskReward) {
-            Log::info('Recommendation downgraded to WAIT due to poor R:R', [
-                'original_action' => $action, 'rr' => $rrValue, 'required' => $minRiskReward,
-            ]);
-            $aiResult['action'] = 'WAIT';
-            $aiResult['reasoning'] = trim(($aiResult['reasoning'] ?? '') . " [Auto-downgraded: R:R ratio ({$riskReward}) below minimum 1:{$minRiskReward} threshold after price validation.]");
-            $aiResult['confidence'] = 0;
-            return $aiResult;
+            $detLevels = $this->computeDeterministicLevels($action, $entry, $taData, $constraints);
+
+            if ($detLevels !== null && $detLevels['rr_value'] >= $minRiskReward) {
+                // Deterministic fallback succeeded — use its levels
+                $tp1 = $detLevels['tp1'];
+                $tp2 = $detLevels['tp2'];
+                $tp3 = $detLevels['tp3'];
+                $sl  = $detLevels['sl'];
+                $rrValue    = $detLevels['rr_value'];
+                $riskReward = $detLevels['risk_reward'];
+                $aiResult['reasoning'] = trim(($aiResult['reasoning'] ?? '') .
+                    " [TP/SL recalculated by deterministic fallback: AI produced R:R 1:{$rrValue}, PHP engine achieved 1:{$detLevels['rr_value']} using real S/R levels.]");
+            } else {
+                // Even deterministic fallback failed — now downgrade to WAIT
+                Log::info('Recommendation downgraded to WAIT: R:R below minimum even after deterministic recalculation', [
+                    'original_action' => $action,
+                    'ai_rr'           => $rrValue,
+                    'det_rr'          => $detLevels['rr_value'] ?? 'N/A',
+                    'required'        => $minRiskReward,
+                ]);
+                $aiResult['action']     = 'WAIT';
+                $aiResult['tp1']        = null;
+                $aiResult['tp2']        = null;
+                $aiResult['tp3']        = null;
+                $aiResult['sl']         = null;
+                $aiResult['risk_reward']= 'N/A';
+                $aiResult['reasoning']  = trim(($aiResult['reasoning'] ?? '') .
+                    " [Auto-downgraded: R:R ratio ({$riskReward}) below minimum 1:{$minRiskReward} threshold even after deterministic TP/SL recalculation.]");
+                $aiResult['confidence'] = 0;
+                return $aiResult;
+            }
         }
 
         // 5. Reconcile the model's self-reported confidence with the technical confidence
@@ -589,6 +918,253 @@ class AnalysisController extends Controller
         return (int) round($aiConfidence);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ⚡ DETERMINISM FIX — Layer 2: Deterministic TP/SL Fallback
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Compute TP1/TP2/TP3/SL entirely from deterministic PHP logic using real
+     * S/R levels, Order Blocks, Volume Profile, and ATR data already computed
+     * by the Python TA engine.
+     *
+     * Called when the AI's own TP/SL produce an R:R below the minimum threshold.
+     * Returns null only if no usable price levels exist in the TA data at all.
+     *
+     * @param  string $action      'BUY' | 'SELL'
+     * @param  float  $price       current price
+     * @param  array  $taData      full TA payload from Python engine
+     * @param  array  $constraints timeframe constraints (max_tp3, tp_step, sl_ratio)
+     * @return array|null          { tp1, tp2, tp3, sl, risk_reward, rr_value } or null
+     */
+    private function computeDeterministicLevels(
+        string $action,
+        float  $price,
+        array  $taData,
+        array  $constraints
+    ): ?array {
+        if ($price <= 0) return null;
+
+        $supports    = collect($taData['classical']['support_resistance']['support']    ?? [])
+                         ->pluck('price')->map(fn($p) => (float)$p)->sort()->values()->toArray();
+        $resistances = collect($taData['classical']['support_resistance']['resistance'] ?? [])
+                         ->pluck('price')->map(fn($p) => (float)$p)->sort()->values()->toArray();
+        $orderBlocks = $taData['smc']['order_blocks']    ?? [];
+        $fvgs        = $taData['smc']['fair_value_gaps'] ?? [];
+        $poc         = (float) ($taData['volume_profile']['key_levels']['poc'] ?? 0);
+        $vah         = (float) ($taData['volume_profile']['key_levels']['vah'] ?? 0);
+        $val         = (float) ($taData['volume_profile']['key_levels']['val'] ?? 0);
+        $atr         = (float) ($taData['classical']['atr']['current'] ?? 0);
+
+        $maxDist = $price * $constraints['max_tp3'];
+        $slRatio = $constraints['sl_ratio'];
+        $minStep = $price * $constraints['tp_step'] * 0.5;
+
+        // Helper: collect candidate TP levels from multiple sources
+        $buildCandidates = function (bool $above) use (
+            $price, $maxDist, $supports, $resistances, $orderBlocks, $fvgs, $poc, $vah, $val
+        ): array {
+            $levels = [];
+
+            // Classical S/R
+            foreach ($above ? $resistances : $supports as $p) {
+                if ($above && $p > $price && $p <= $price + $maxDist) $levels[] = (float)$p;
+                if (!$above && $p < $price && $p >= $price - $maxDist) $levels[] = (float)$p;
+            }
+
+            // Order Block midpoints
+            foreach ($orderBlocks as $ob) {
+                $mid = ((float)($ob['bottom'] ?? 0) + (float)($ob['top'] ?? 0)) / 2;
+                if ($mid <= 0) continue;
+                if ($above && $mid > $price && $mid <= $price + $maxDist) $levels[] = $mid;
+                if (!$above && $mid < $price && $mid >= $price - $maxDist) $levels[] = $mid;
+            }
+
+            // FVG midpoints
+            foreach ($fvgs as $fvg) {
+                $mid = ((float)($fvg['bottom'] ?? 0) + (float)($fvg['top'] ?? 0)) / 2;
+                if ($mid <= 0) continue;
+                if ($above && $mid > $price && $mid <= $price + $maxDist) $levels[] = $mid;
+                if (!$above && $mid < $price && $mid >= $price - $maxDist) $levels[] = $mid;
+            }
+
+            // Volume Profile
+            foreach ([$poc, $vah, $val] as $vp) {
+                if ($vp <= 0) continue;
+                if ($above && $vp > $price && $vp <= $price + $maxDist) $levels[] = $vp;
+                if (!$above && $vp < $price && $vp >= $price - $maxDist) $levels[] = $vp;
+            }
+
+            return $above ? array_unique(array_values(array_filter($levels)))
+                          : array_unique(array_values(array_filter($levels)));
+        };
+
+        if ($action === 'SELL') {
+            // TP candidates: levels BELOW current price (sorted descending: closest first)
+            $tpCandidates = $buildCandidates(false);
+            rsort($tpCandidates);
+
+            // SL: first level ABOVE price from OB/resistance + ATR buffer
+            $slCandidates = [];
+            foreach ($resistances as $p) {
+                if ($p > $price && $p <= $price + $maxDist) $slCandidates[] = (float)$p;
+            }
+            foreach ($orderBlocks as $ob) {
+                if (strtolower($ob['type'] ?? '') === 'bearish') {
+                    $top = (float)($ob['top'] ?? 0);
+                    if ($top > $price && $top <= $price + $maxDist) $slCandidates[] = $top;
+                }
+            }
+            sort($slCandidates);
+            $atrBuffer = max($atr * 1.5, $price * $slRatio * 0.5);
+            $sl = !empty($slCandidates)
+                ? min($slCandidates[0] + $atrBuffer, $price + $maxDist)
+                : $price + ($price * $slRatio);
+
+        } else { // BUY
+            // TP candidates: levels ABOVE current price (sorted ascending: closest first)
+            $tpCandidates = $buildCandidates(true);
+            sort($tpCandidates);
+
+            // SL: first level BELOW price from OB/support + ATR buffer
+            $slCandidates = [];
+            foreach ($supports as $p) {
+                if ($p < $price && $p >= $price - $maxDist) $slCandidates[] = (float)$p;
+            }
+            foreach ($orderBlocks as $ob) {
+                if (strtolower($ob['type'] ?? '') === 'bullish') {
+                    $bottom = (float)($ob['bottom'] ?? 0);
+                    if ($bottom < $price && $bottom >= $price - $maxDist) $slCandidates[] = $bottom;
+                }
+            }
+            rsort($slCandidates);
+            $atrBuffer = max($atr * 1.5, $price * $slRatio * 0.5);
+            $sl = !empty($slCandidates)
+                ? max($slCandidates[0] - $atrBuffer, $price - $maxDist)
+                : $price - ($price * $slRatio);
+        }
+
+        // Pick TP1, TP2, TP3 — spaced at least $minStep apart
+        $tp1 = null; $tp2 = null; $tp3 = null;
+        $picked = [];
+        foreach ($tpCandidates as $candidate) {
+            $ok = true;
+            if (abs($candidate - $price) < $minStep) { $ok = false; }
+            foreach ($picked as $prev) {
+                if (abs($candidate - $prev) < $minStep) { $ok = false; break; }
+            }
+            if (!$ok) continue;
+            $picked[] = $candidate;
+            if ($tp1 === null)      { $tp1 = $candidate; }
+            elseif ($tp2 === null)  { $tp2 = $candidate; }
+            elseif ($tp3 === null)  { $tp3 = $candidate; break; }
+        }
+
+        // If not enough distinct levels found, synthesize the missing ones
+        if ($tp1 === null) {
+            $tp1 = $action === 'SELL' ? $price - $minStep * 2 : $price + $minStep * 2;
+        }
+        if ($tp2 === null) {
+            $tp2 = $action === 'SELL' ? $tp1 - $minStep * 2 : $tp1 + $minStep * 2;
+        }
+        if ($tp3 === null) {
+            $tp3 = $action === 'SELL' ? $tp2 - $minStep * 2 : $tp2 + $minStep * 2;
+        }
+
+        // Clamp to max distance
+        $floor   = $price - $maxDist;
+        $ceiling = $price + $maxDist;
+        if ($action === 'SELL') {
+            $tp1 = max($tp1, $floor); $tp2 = max($tp2, $floor); $tp3 = max($tp3, $floor);
+            // Ensure TP1 > TP2 > TP3 for SELL
+            if ($tp2 >= $tp1) $tp2 = $tp1 - $minStep;
+            if ($tp3 >= $tp2) $tp3 = $tp2 - $minStep;
+        } else {
+            $tp1 = min($tp1, $ceiling); $tp2 = min($tp2, $ceiling); $tp3 = min($tp3, $ceiling);
+            // Ensure TP1 < TP2 < TP3 for BUY
+            if ($tp2 <= $tp1) $tp2 = $tp1 + $minStep;
+            if ($tp3 <= $tp2) $tp3 = $tp2 + $minStep;
+        }
+
+        // Calculate final R:R using TP2
+        $risk     = abs($price - $sl);
+        $reward   = abs($tp2  - $price);
+        $rrValue  = $risk > 0 ? round($reward / $risk, 2) : 0;
+
+        if ($risk <= 0 || $rrValue <= 0) return null;
+
+        Log::info('Deterministic TP/SL fallback computed', [
+            'action' => $action, 'price' => $price,
+            'tp1' => $tp1, 'tp2' => $tp2, 'tp3' => $tp3, 'sl' => $sl, 'rr' => $rrValue,
+        ]);
+
+        return [
+            'tp1'         => round($tp1, 8),
+            'tp2'         => round($tp2, 8),
+            'tp3'         => round($tp3, 8),
+            'sl'          => round($sl, 8),
+            'risk_reward' => "1:{$rrValue}",
+            'rr_value'    => $rrValue,
+        ];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ⚡ DETERMINISM FIX — Layer 3: Signal Consistency Check
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Compare the current signal with the last one for the same symbol/timeframe.
+     * If the action changed within the last 5 minutes (from e.g. SELL to WAIT)
+     * AND the price difference is less than 0.1%,
+     * it means the AI produced conflicting answers for identical market data.
+     * We inject a visible warning so the user knows the signal is unstable.
+     *
+     * Returns a warning string, or null if signals are stable.
+     */
+    private function checkConsistency(string $symbol, string $timeframe, float $currentPrice, array $currentResult): ?string
+    {
+        $cacheKey  = "last_signal_{$symbol}_{$timeframe}";
+        $lastSignal = \Illuminate\Support\Facades\Cache::get($cacheKey);
+
+        // Store current result for the next call
+        \Illuminate\Support\Facades\Cache::put($cacheKey, [
+            'action'     => $currentResult['action'] ?? 'WAIT',
+            'risk_reward'=> $currentResult['risk_reward'] ?? 'N/A',
+            'price'      => $currentPrice,
+            'timestamp'  => now()->timestamp,
+        ], 300); // remember for 5 minutes
+
+        if (!$lastSignal || $currentPrice <= 0) return null;
+
+        $secondsAgo  = now()->timestamp - (int) ($lastSignal['timestamp'] ?? 0);
+        $lastAction  = $lastSignal['action'] ?? 'WAIT';
+        $lastPrice   = (float) ($lastSignal['price'] ?? 0);
+        $thisAction  = $currentResult['action'] ?? 'WAIT';
+
+        // Calculate absolute price difference percentage
+        $priceDiffPct = $lastPrice > 0 ? abs($currentPrice - $lastPrice) / $lastPrice : 0;
+
+        // Only flag if actions differ AND they are within 300 seconds (5 mins) 
+        // AND price difference is less than 0.1% (market barely moved)
+        if ($secondsAgo <= 300 && $lastAction !== $thisAction && $priceDiffPct < 0.001) {
+            $diffStr = number_format($priceDiffPct * 100, 3) . '%';
+            $warning = "⚠️ SIGNAL INSTABILITY DETECTED: Previous signal ({$secondsAgo}s ago) was '{$lastAction}' "
+                     . "but current signal is '{$thisAction}'. Price moved only {$diffStr}. "
+                     . "This indicates AI non-determinism. Wait for confirmation before trading.";
+
+            Log::warning('Signal instability detected', [
+                'symbol'      => $symbol,
+                'timeframe'   => $timeframe,
+                'last_action' => $lastAction,
+                'this_action' => $thisAction,
+                'seconds_ago' => $secondsAgo,
+            ]);
+
+            return $warning;
+        }
+
+        return null;
+    }
+
     private function loadAiSettings(): array
     {
         $settingsFile = storage_path('app/ai_settings.json');
@@ -605,9 +1181,18 @@ class AnalysisController extends Controller
     {
         return match ($timeframe) {
             '1m', '5m'   => ['max_tp3' => 0.02,   'tp_step' => 0.005,  'sl_ratio' => 0.008],
-            '15m', '30m' => ['max_tp3' => 0.04,   'tp_step' => 0.01,   'sl_ratio' => 0.015],
-            '1h'         => ['max_tp3' => 0.08,   'tp_step' => 0.02,   'sl_ratio' => 0.025],
-            '4h'         => ['max_tp3' => 0.15,   'tp_step' => 0.04,   'sl_ratio' => 0.05],
+            // 15m/30m/1h tuned from a real expectancy backtest (services/trade_optimizer.py,
+            // then re-verified per-timeframe with services/optimize-trade-params) over
+            // 1180-1380 points / 5 symbols each: tp_step ×0.5, sl_ratio ×1.5 won on every
+            // timeframe tested. Opportunity-adjusted score improved 15m 0.026→0.309,
+            // 30m 0.099→0.362, 1h 0.085→0.485, 4h 0.147→1.045. '1d'/'1w' left at the old
+            // guessed values — not tested, don't extrapolate an untested timeframe.
+            '15m'        => ['max_tp3' => 0.02,   'tp_step' => 0.005,  'sl_ratio' => 0.0225],
+            '30m'        => ['max_tp3' => 0.02,   'tp_step' => 0.005,  'sl_ratio' => 0.0225],
+            '1h'         => ['max_tp3' => 0.04,   'tp_step' => 0.01,   'sl_ratio' => 0.0375],
+            // 4h: best combo used expiry×3 (not ×2 like the others) — tp_step/sl_ratio
+            // multipliers are the same, only its expiry window differs below.
+            '4h'         => ['max_tp3' => 0.075,  'tp_step' => 0.02,   'sl_ratio' => 0.075],
             '1d'         => ['max_tp3' => 0.25,   'tp_step' => 0.08,   'sl_ratio' => 0.08],
             '1w'         => ['max_tp3' => 0.50,   'tp_step' => 0.15,   'sl_ratio' => 0.15],
             default      => ['max_tp3' => 0.15,   'tp_step' => 0.04,   'sl_ratio' => 0.05],
@@ -618,9 +1203,13 @@ class AnalysisController extends Controller
     {
         return match ($timeframe) {
             '1m', '5m'         => 1,
-            '15m', '30m'       => 4,
-            '1h'               => 8,
-            '4h'               => 24,
+            // Doubled (15m/30m/1h) or tripled (4h) per timeframe — same backtest as
+            // getTimeframeConstraints() above; most trades were expiring unresolved
+            // before a TP/SL was ever reached.
+            '15m'              => 8,
+            '30m'              => 8,
+            '1h'               => 16,
+            '4h'               => 72,
             '1d'               => 72,
             '1w'               => 168,
             default            => 24,

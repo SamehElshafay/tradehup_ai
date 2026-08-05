@@ -14,6 +14,10 @@ class PaperTradingController extends Controller {
 
     public function sessions(Request $request): JsonResponse {
         $sessions = $request->user()->paperSessions()->latest()->get();
+        $sessions->each(function($session) {
+            $session->total_profit = $session->totalProfit();
+            $session->total_loss = $session->totalLoss();
+        });
         return response()->json(['sessions' => $sessions]);
     }
 
@@ -42,6 +46,8 @@ class PaperTradingController extends Controller {
         $session = PaperTradingSession::where('user_id', $request->user()->id)->findOrFail($id);
         $session->load('trades.coin');
         $session->pnl_percent = $session->pnlPercent();
+        $session->total_profit = $session->totalProfit();
+        $session->total_loss = $session->totalLoss();
         return response()->json(['session' => $session]);
     }
 
@@ -61,6 +67,22 @@ class PaperTradingController extends Controller {
         $session = PaperTradingSession::where('user_id', $request->user()->id)->where('status', 'active')->findOrFail($request->session_id);
         $coin = Coin::findOrFail($request->coin_id);
         $entryPrice = $this->taService->getPrice($coin->symbol) ?? $coin->current_price;
+
+        // Guard: the SL/TP levels attached to this request were computed against the price
+        // at recommendation time, but entryPrice above is a fresh live quote. If price moved
+        // between the two, the SL can end up on the wrong side of (or already past) the new
+        // entry — opening a trade that is already invalid. Reject rather than open it dead.
+        $isBuy = $request->type === 'BUY';
+        $sl    = (float) $request->sl;
+        $slInvalid = $isBuy ? ($sl >= $entryPrice) : ($sl <= $entryPrice);
+        if ($slInvalid) {
+            return response()->json([
+                'message' => 'Price moved since this recommendation was generated — the stop-loss is no longer valid at the current price. Please re-run the analysis before opening this trade.',
+                'entry_price' => $entryPrice,
+                'sl' => $sl,
+            ], 409);
+        }
+
         $cost = $entryPrice * $request->quantity;
         if ($cost > $session->current_balance) {
             // Auto-top-up balance to allow unlimited trade tracking

@@ -26,7 +26,7 @@ class TradeTrackerService
         $url = "https://api.binance.com/api/v3/klines";
         
         try {
-            $response = Http::get($url, [
+            $response = Http::withoutVerifying()->get($url, [
                 'symbol' => $symbol,
                 'interval' => '1m',
                 'startTime' => $startTime,
@@ -46,12 +46,27 @@ class TradeTrackerService
             $tp3 = $rec->tp3 ? (float) $rec->tp3 : null;
             $sl = $rec->sl ? (float) $rec->sl : null;
 
+            // The recommendation was created at this timestamp (ms)
+            // We must only evaluate candles that OPENED at or after this time
+            // to avoid false hits from the candle that was already in-progress
+            // when the recommendation was saved (Bug: TP hit 1 second before entry).
+            $recCreatedMs = $rec->created_at->timestamp * 1000;
+
             $newStatus = null;
 
             foreach ($klines as $kline) {
                 // kline format: [Open time, Open, High, Low, Close, Volume, Close time, ...]
+                $candleOpenMs = (int) $kline[0];
                 $high = (float) $kline[2];
                 $low = (float) $kline[3];
+
+                // Skip candles that opened before the recommendation was created.
+                // A 1m candle opening at 10:58:00 covers 10:58:00-10:58:59;
+                // if the recommendation was created at 10:58:02, the first 2 seconds
+                // of price action are irrelevant (the trade didn't exist yet).
+                if ($candleOpenMs < $recCreatedMs) {
+                    continue;
+                }
 
                 if ($rec->action === 'BUY') {
                     // Check SL first within the same 1m candle (pessimistic)

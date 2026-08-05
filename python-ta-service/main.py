@@ -3,12 +3,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import traceback
+import pandas as pd
 
 from services.binance_fetcher import fetch_ohlcv, fetch_ticker_price, fetch_top_coins, _cache
 from services.classical_analysis import run_classical_analysis
 from services.smc_analysis import run_smc_analysis
 from services.harmonic_analysis import run_harmonic_analysis
 from services.volume_profile import run_volume_profile_analysis
+from services.bias_combiner import compute_overall_bias
+from services.backtest import run_backtest, run_realistic_backtest
+from services.weight_search import search_weights
+from services.trade_optimizer import optimize_trade_params
+from services.filter_validator import validate_filter
+from services.ob_rule_validator import validate_ob_rule
 
 # Clear any stale cache on startup
 _cache.clear()
@@ -82,41 +89,10 @@ def analyze(req: AnalysisRequest):
         harmonic = run_harmonic_analysis(df)
         volume = run_volume_profile_analysis(df)
 
-        # Determine overall bias by weighting all schools
-        bias_scores = {"bullish": 0, "bearish": 0}
-
-        # Classical weight: 30%
-        if classical["bias"] == "bullish":
-            bias_scores["bullish"] += 30 * (classical["bullish_signals"] / max(classical["bullish_signals"] + classical["bearish_signals"], 1))
-        elif classical["bias"] == "bearish":
-            bias_scores["bearish"] += 30 * (classical["bearish_signals"] / max(classical["bullish_signals"] + classical["bearish_signals"], 1))
-
-        # SMC weight: 40%
-        if smc["bias"] == "bullish":
-            bias_scores["bullish"] += 40
-        elif smc["bias"] == "bearish":
-            bias_scores["bearish"] += 40
-
-        # Harmonic weight: 20%
-        if harmonic["bias"] == "bullish":
-            bias_scores["bullish"] += 20
-        elif harmonic["bias"] == "bearish":
-            bias_scores["bearish"] += 20
-
-        # Volume Profile weight: 10%
-        if volume["bias"] in ["bullish", "slightly_bullish"]:
-            bias_scores["bullish"] += 10
-        elif volume["bias"] in ["bearish", "slightly_bearish"]:
-            bias_scores["bearish"] += 10
-
-        # ── Overall bias — classical gets 30%, SMC 40%, harmonic 20%, volume 10% ──
-        # If classical is strong_downtrend, cap the max bullish from other schools
-        classical_trend = classical.get("moving_averages", {}).get("trend", "neutral")
-        overall_bias = "bullish" if bias_scores["bullish"] > bias_scores["bearish"] else "bearish"
-        # Hard override: if price is below ALL 3 EMAs AND SMC is also bearish → force bearish
-        if classical_trend in ["strong_downtrend"] and smc.get("bias") != "bullish":
-            overall_bias = "bearish"
-        overall_confidence = int(max(bias_scores["bullish"], bias_scores["bearish"]))
+        # Determine overall bias by weighting all schools (Classical 30%, SMC 10%,
+        # Harmonic 50%, Volume 10% — data-derived, see bias_combiner.py) — shared
+        # with the backtester so both stay in sync.
+        overall_bias, overall_confidence = compute_overall_bias(classical, smc, harmonic, volume)
 
         # Collect confluences — each must be directionally validated vs. current price
         confluences = []
@@ -227,11 +203,21 @@ def analyze(req: AnalysisRequest):
             }, axis=1
         ).tolist()
 
+        # Sum the actual volume of every candle whose open_time falls within the last
+        # 24h — works for any interval (1m..1w) instead of a hardcoded per-interval
+        # candle count, which previously fell back to a single candle's volume for
+        # any timeframe other than exactly '1h' or '4h' (e.g. 15m, 5m, 30m).
+        volume_col = pd.to_numeric(df.get("quote_volume", df["volume"]))
+        last_time = df["open_time"].iloc[-1]
+        window_mask = df["open_time"] >= (last_time - pd.Timedelta(hours=24))
+        volume_24h = float(volume_col[window_mask].sum())
+
         return {
             "symbol": symbol,
             "interval": req.interval,
             "analyzed_at": str(df["open_time"].iloc[-1]),
             "current_price": float(df["close"].iloc[-1]),
+            "volume_24h": volume_24h,
             "overall_bias": overall_bias,
             "overall_confidence": overall_confidence,
             "confluences": confluences,
@@ -293,6 +279,120 @@ def get_top_coins(limit: int = 50):
         return {"coins": coins, "count": len(coins)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/backtest")
+def backtest(
+    symbol: str,
+    exchange: str = "binance",
+    interval: str = "15m",
+    limit: int = 1000,
+    horizon: int = 6,
+    min_move_pct: float = 0.3,
+):
+    """
+    Walk-forward validation of the deterministic Classical+SMC+Harmonic+Volume
+    engine, independent of the AI. Replays historical candles, re-runs the
+    same analysis at each point using only data available then, and checks
+    whether price actually moved in the predicted direction `horizon`
+    candles later. Returns a real win-rate-by-confidence-bucket table.
+    """
+    try:
+        return run_backtest(
+            symbol=symbol.upper(),
+            exchange=exchange,
+            interval=interval,
+            limit=limit,
+            horizon=horizon,
+            min_move_pct=min_move_pct,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backtest failed: {str(e)}\n{traceback.format_exc()}")
+
+
+@app.get("/backtest-realistic")
+def backtest_realistic(symbol: str, exchange: str = "binance", interval: str = "15m", limit: int = 1000):
+    """
+    Like /backtest, but simulates the ACTUAL trade rules (TP1/TP2/TP3/SL from
+    the same timeframe constraints + ATR gate AnalysisController uses, walked
+    candle-by-candle with SL checked first) instead of a simple % move
+    threshold. Directly comparable to real paper-trade win rates.
+    """
+    try:
+        return run_realistic_backtest(symbol=symbol.upper(), exchange=exchange, interval=interval, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Realistic backtest failed: {str(e)}\n{traceback.format_exc()}")
+
+
+@app.get("/optimize-trade-params")
+def optimize_trade_params_endpoint(symbols: str, interval: str = "15m", limit: int = 500):
+    """
+    Grid-searches TP-distance / expiry-window / SL-distance multipliers for
+    the combo that maximizes real expectancy (win_rate*avg_win - loss_rate*
+    avg_loss, scaled by how often trades actually resolve) — not raw win
+    rate, which can be trivially gamed with a tiny TP and a huge SL.
+    `symbols` is comma-separated, e.g. "BTCUSDT,ETHUSDT,PENGUUSDT".
+    """
+    try:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        return optimize_trade_params(symbols=symbol_list, interval=interval, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Trade param search failed: {str(e)}\n{traceback.format_exc()}")
+
+
+@app.get("/validate-filter")
+def validate_filter_endpoint(symbols: str, interval: str = "15m", limit: int = 500):
+    """
+    Replays PreTradeFilterService's Market Structure check + Pattern Agreement
+    penalty + Confidence Gate against real historical outcomes (using the
+    tuned tp/expiry/sl multipliers from /optimize-trade-params), comparing a
+    no-filter baseline against several candidate confidence thresholds — so
+    the 65% default can be checked against data instead of staying a guess.
+    """
+    try:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        return validate_filter(symbols=symbol_list, interval=interval, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Filter validation failed: {str(e)}\n{traceback.format_exc()}")
+
+
+@app.get("/optimize-weights")
+def optimize_weights(
+    symbols: str,
+    interval: str = "15m",
+    limit: int = 500,
+    horizon: int = 6,
+    min_move_pct: float = 0.3,
+    step: int = 10,
+):
+    """
+    Grid-searches Classical/SMC/Harmonic/Volume weight combinations (in steps
+    of `step`, summing to 100) against real historical outcomes, to find
+    weights that actually beat the current hand-picked 30/40/20/10 split.
+    `symbols` is a comma-separated list, e.g. "BTCUSDT,ETHUSDT,SOLUSDT".
+    """
+    try:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        return search_weights(
+            symbols=symbol_list,
+            interval=interval,
+            limit=limit,
+            horizon=horizon,
+            min_move_pct=min_move_pct,
+            step=step,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Weight search failed: {str(e)}\n{traceback.format_exc()}")
 
 
 def _build_chart_overlays(classical: dict, smc: dict, harmonic: dict, volume: dict) -> dict:

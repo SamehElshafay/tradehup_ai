@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Schedule;
 use App\Jobs\ScanMarketOpportunitiesJob;
 use App\Jobs\EvaluateActiveTradesJob;
 use App\Jobs\UpdatePaperTradesJob;
+use App\Jobs\SyncCoinsJob;
 
 $settingsFile = storage_path('app/ai_settings.json');
 $scanInterval = '4h';
@@ -39,6 +40,10 @@ switch ($scanInterval) {
     case '24h': $scannerJob->daily(); break;
     default:    $scannerJob->everyFourHours(); break;
 }
+
+// Refresh coin metadata (price_change_24h, market_cap, high/low_24h) — was written
+// but never wired into the scheduler, so every coin sat stuck at its DB defaults.
+Schedule::job(new SyncCoinsJob)->hourly();
 
 // Evaluate active trades accurately via 1m klines every 5 minutes
 Schedule::job(new EvaluateActiveTradesJob)->everyFiveMinutes();

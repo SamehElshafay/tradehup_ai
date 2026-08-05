@@ -20,4 +20,10 @@ class PaperTradingSession extends Model {
         if ($this->initial_balance == 0) return 0;
         return (($this->current_balance - $this->initial_balance) / $this->initial_balance) * 100;
     }
+    public function totalProfit(): float {
+        return (float) $this->trades()->where('pnl', '>', 0)->sum('pnl');
+    }
+    public function totalLoss(): float {
+        return (float) $this->trades()->where('pnl', '<', 0)->sum('pnl');
+    }
 }

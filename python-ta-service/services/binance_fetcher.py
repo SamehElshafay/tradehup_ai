@@ -64,7 +64,7 @@ def _fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     if BINANCE_API_KEY:
         headers["X-MBX-APIKEY"] = BINANCE_API_KEY
 
-    response = requests.get(url, params=params, headers=headers, timeout=10)
+    response = requests.get(url, params=params, headers=headers, timeout=10, verify=False)
     response.raise_for_status()
     raw = response.json()
 
@@ -73,8 +73,8 @@ def _fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         "close_time", "quote_volume", "trades",
         "taker_buy_base", "taker_buy_quote", "ignore"
     ])
-    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df = df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].copy()
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
     return df
@@ -97,36 +97,34 @@ def _fetch_bybit(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         "interval": bybit_interval,
         "limit": min(limit, 1000)
     }
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(url, params=params, timeout=10, verify=False)
     response.raise_for_status()
-    data = response.json()
+    raw = response.json()
 
-    if data.get("retCode") != 0:
-        raise Exception(f"Bybit API error: {data.get('retMsg')}")
+    if raw["retCode"] != 0:
+        raise ValueError(f"Bybit API Error: {raw['retMsg']}")
 
-    raw = data["result"]["list"]
-    # Bybit returns newest first, reverse it
-    raw = list(reversed(raw))
-
-    rows = []
-    for candle in raw:
-        rows.append({
-            "open_time": pd.to_datetime(int(candle[0]), unit="ms"),
-            "open":   float(candle[1]),
-            "high":   float(candle[2]),
-            "low":    float(candle[3]),
-            "close":  float(candle[4]),
-            "volume": float(candle[5]),
-        })
-
-    return pd.DataFrame(rows)
+    data = raw["result"]["list"]
+    # Bybit returns newest first, so we reverse it
+    df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
+    df = df.iloc[::-1].reset_index(drop=True)
+    df = df[["open_time", "open", "high", "low", "close", "volume", "turnover"]].copy()
+    df.rename(columns={"turnover": "quote_volume"}, inplace=True)
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
+    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+        df[col] = pd.to_numeric(df[col])
+    return df
 
 
 def _fetch_mexc(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Fetch OHLCV from MEXC REST API (Binance-compatible endpoint)."""
+    """Fetch OHLCV from MEXC REST API."""
     url = "https://api.mexc.com/api/v3/klines"
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": min(limit, 1000)}
-    response = requests.get(url, params=params, timeout=10)
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": min(limit, 1000)
+    }
+    response = requests.get(url, params=params, timeout=10, verify=False)
     response.raise_for_status()
     raw = response.json()
 
@@ -135,9 +133,9 @@ def _fetch_mexc(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         "close_time", "quote_volume", "trades",
         "taker_buy_base", "taker_buy_quote", "ignore"
     ])
-    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    for col in ["open", "high", "low", "close", "volume"]:
+    df = df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].copy()
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
+    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
         df[col] = pd.to_numeric(df[col])
     return df
 
@@ -148,21 +146,21 @@ def fetch_ticker_price(symbol: str, exchange: str = "binance") -> float:
 
     if exchange == "bybit":
         url = "https://api.bybit.com/v5/market/tickers"
-        response = requests.get(url, params={"category": "spot", "symbol": symbol.upper()}, timeout=5)
+        response = requests.get(url, params={"category": "spot", "symbol": symbol.upper()}, timeout=5, verify=False)
         response.raise_for_status()
         data = response.json()
         return float(data["result"]["list"][0]["lastPrice"])
 
     elif exchange == "mexc":
         url = "https://api.mexc.com/api/v3/ticker/price"
-        response = requests.get(url, params={"symbol": symbol.upper()}, timeout=5)
+        response = requests.get(url, params={"symbol": symbol.upper()}, timeout=5, verify=False)
         response.raise_for_status()
         return float(response.json()["price"])
 
     else:
         # Default: Binance
         url = "https://api.binance.com/api/v3/ticker/price"
-        response = requests.get(url, params={"symbol": symbol.upper()}, timeout=5)
+        response = requests.get(url, params={"symbol": symbol.upper()}, timeout=5, verify=False)
         response.raise_for_status()
         return float(response.json()["price"])
 
@@ -170,7 +168,7 @@ def fetch_ticker_price(symbol: str, exchange: str = "binance") -> float:
 def fetch_top_coins(limit: int = 50) -> list:
     """Fetch top trading pairs by volume (USDT pairs only) from Binance."""
     url = "https://api.binance.com/api/v3/ticker/24hr"
-    response = requests.get(url, timeout=10)
+    response = requests.get(url, timeout=10, verify=False)
     response.raise_for_status()
     all_tickers = response.json()
 

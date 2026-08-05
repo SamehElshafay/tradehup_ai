@@ -89,7 +89,11 @@ class OpenRouterService {
         );
 
         try {
-            $cleaned = preg_replace('/```json|```/', '', $response);
+            if (preg_match('/\{.*\}/s', $response, $matches)) {
+                $cleaned = $matches[0];
+            } else {
+                $cleaned = $response;
+            }
             $cleaned = preg_replace('/(\d),(\d)/', '$1$2', $cleaned);
             $result  = json_decode(trim($cleaned), true);
             if (json_last_error() !== JSON_ERROR_NONE) {
@@ -122,7 +126,11 @@ class OpenRouterService {
         );
 
         try {
-            $cleaned = preg_replace('/```json|```/', '', $response);
+            if (preg_match('/\{.*\}/s', $response, $matches)) {
+                $cleaned = $matches[0];
+            } else {
+                $cleaned = $response;
+            }
             $cleaned = preg_replace('/(\d),(\d)/', '$1$2', $cleaned);
             $result  = json_decode(trim($cleaned), true);
             if (json_last_error() !== JSON_ERROR_NONE) {
@@ -157,7 +165,7 @@ class OpenRouterService {
         );
     }
 
-    public function chatWithHistory(array $messages, ?string $model = null): string {
+    public function chatWithHistory(array $messages, ?string $model = null, array $tools = []): array|string {
         if ($this->isLocalMode()) {
             $lastMessage = end($messages)['content'] ?? '';
             return "Local mode active. Your message: \"{$lastMessage}\". Configure OPENROUTER_API_KEY to enable full AI responses.";
@@ -172,6 +180,11 @@ class OpenRouterService {
             'temperature' => (float) ($settings['chat_temperature'] ?? 0.7),
             'max_tokens'  => (int) ($settings['chat_max_tokens'] ?? 800),
         ];
+        
+        if (!empty($tools)) {
+            $body['tools'] = $tools;
+        }
+
         // keep_alive is Ollama-only
         if ($this->provider === 'ollama') {
             $body['keep_alive'] = $settings['keep_alive'] ?? '10m';
@@ -189,7 +202,14 @@ class OpenRouterService {
             throw new Exception('LLM API error: ' . $response->body());
         }
 
-        return $response->json()['choices'][0]['message']['content'] ?? '';
+        $message = $response->json()['choices'][0]['message'] ?? [];
+        
+        // If there are tool calls, return the raw message object so the caller can process them
+        if (isset($message['tool_calls']) && !empty($message['tool_calls'])) {
+            return $message;
+        }
+
+        return $message['content'] ?? '';
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -201,9 +221,10 @@ class OpenRouterService {
         string $userMessage,
         string $systemPrompt = '',
         int    $maxTokens    = 400,
-        float  $temperature  = 0.1,
-        string $keepAlive    = '10m'
-    ): string {
+        float  $temperature  = 0.0,
+        string $keepAlive    = '10m',
+        array  $tools        = []
+    ): string|array {
         $messages = [];
         if ($systemPrompt) {
             $messages[] = ['role' => 'system', 'content' => $systemPrompt];
@@ -217,6 +238,26 @@ class OpenRouterService {
             'temperature' => $temperature,
             'max_tokens'  => $maxTokens,
         ];
+        
+        if (!empty($tools)) {
+            $body['tools'] = $tools;
+        }
+
+        // Force JSON output for models that support it via API (OpenRouter/Gemini)
+        if ($this->provider === 'openrouter' || $this->provider === 'gemini') {
+            // Only force JSON object if we are not passing tools, because passing JSON object format with tools sometimes conflicts.
+            if (empty($tools)) {
+                $body['response_format'] = ['type' => 'json_object'];
+            }
+        }
+
+        // ⚡ DETERMINISM FIX: Add seed for providers that support it (OpenRouter, Ollama).
+        // A fixed seed + temperature=0 guarantees identical outputs for identical inputs.
+        // Gemini via native API ignores this field gracefully.
+        if ($this->provider === 'openrouter' || $this->provider === 'ollama') {
+            $body['seed'] = 42;
+        }
+
         if ($this->provider === 'ollama') {
             $body['keep_alive'] = $keepAlive;
         }
@@ -233,7 +274,11 @@ class OpenRouterService {
             throw new Exception('LLM API error: ' . $response->body());
         }
 
-        return $response->json()['choices'][0]['message']['content'] ?? '';
+        $message = $response->json()['choices'][0]['message'] ?? [];
+        if (isset($message['tool_calls']) && !empty($message['tool_calls'])) {
+            return $message;
+        }
+        return $message['content'] ?? '';
     }
 
     private function headers(): array {
@@ -263,7 +308,9 @@ class OpenRouterService {
             'chat_model'           => env('OPENROUTER_CHAT_MODEL',    'qwen2.5:1.5b'),
             'analysis_max_tokens'  => 400,
             'chat_max_tokens'      => 800,
-            'analysis_temperature' => 0.1,
+            // ⚡ DETERMINISM FIX: 0.0 instead of 0.1 — eliminates random TP/SL variance
+            // that caused identical market conditions to produce SELL in one run and WAIT in another.
+            'analysis_temperature' => 0.0,
             'chat_temperature'     => 0.7,
             'keep_alive'           => '10m',
             'min_confluences'      => 3,
@@ -360,8 +407,8 @@ class OpenRouterService {
                 // Detect: is current price INSIDE this OB?
                 if ($bottom > 0 && $top > 0 && $currentPrice >= $bottom && $currentPrice <= $top) {
                     $label .= " (PRICE IS INSIDE THIS ZONE ⚠️)";
-                    $obWarnings[] = "⚠️ DANGER: Current price is INSIDE a {$type} Order Block (" . $this->fmtPrice($bottom) . "–" . $this->fmtPrice($top) . "). " .
-                        ($type === 'BEARISH' ? 'This is a high-probability supply/rejection zone. DO NOT issue BUY.' : 'Price is in demand zone.');
+                    $obWarnings[] = "⚠️ NOTE: Current price is INSIDE a {$type} Order Block (" . $this->fmtPrice($bottom) . "–" . $this->fmtPrice($top) . "). " .
+                        ($type === 'BEARISH' ? 'Supply/rejection zone — weigh against other confluences, do not auto-reject a BUY on this alone (real-data check found no significant win-rate difference here).' : 'Price is in demand zone.');
                 } else {
                     $label .= " ({" . round($dist, 2) . "}% {$pos} price)";
                 }
@@ -417,6 +464,77 @@ class OpenRouterService {
             ? "Pre-computed technical confidence: {$computedConfidence}% | Detected confluences: {$computedConfList}"
             : '';
 
+        // News block
+        $newsData  = $data['specific_news'] ?? [];
+        $newsBlock = '';
+        if (!empty($newsData)) {
+            $newsBlock = "\n📰 LATEST FUNDAMENTAL NEWS (LAST 24H):\n";
+            foreach ($newsData as $n) {
+                $newsBlock .= "- [" . strtoupper($n['sentiment']) . "] " . $n['title'] . "\n";
+            }
+        }
+
+        // Pre-Trade Filter block – surface warnings and adjusted confidence to the AI
+        $filterData   = $data['pre_trade_filter'] ?? null;
+        $filterBlock  = '';
+        if ($filterData) {
+            $adjConf  = $filterData['adjusted_confidence'] ?? $computedConfidence;
+            $verdict  = $filterData['pre_trade_verdict']  ?? 'PROCEED';
+            $filterWarnings = $filterData['warnings'] ?? [];
+            $filterBlock  = "\n🔍 PRE-TRADE QUALITY FILTER:\n";
+            $filterBlock .= "Verdict: {$verdict} | Adjusted Confidence: {$adjConf}%\n";
+            if (!empty($filterWarnings)) {
+                foreach ($filterWarnings as $w) {
+                    $filterBlock .= "  {$w}\n";
+                }
+            }
+            if ($verdict === 'WAIT') {
+                $filterBlock .= "⚠️ The pre-trade filter signals WAIT. Only override with STRONG multi-school confluence.\n";
+            }
+        }
+
+        // Session context block
+        $sessionData  = $data['session_context'] ?? null;
+        $sessionBlock = '';
+        if ($sessionData) {
+            $sessions      = implode(' + ', $sessionData['active_sessions'] ?? ['Unknown']);
+            $sessionFilter = $sessionData['trade_filter'] ?? 'PROCEED';
+            $sessionAlert  = $sessionData['session_alert'] ?? '';
+            $sessionBlock  = "\n⏰ MARKET SESSION: {$sessions} | {$sessionData['utc_time']} | Filter: {$sessionFilter}\n";
+            if ($sessionAlert) {
+                $sessionBlock .= "  {$sessionAlert}\n";
+            }
+            if ($sessionFilter === 'AVOID') {
+                $sessionBlock .= "⚠️ LOW LIQUIDITY: Avoid BUY/SELL — prefer WAIT. Fakeouts are common now.\n";
+            } elseif ($sessionFilter === 'CAUTION') {
+                $sessionBlock .= "⚠️ HIGH CAUTION: Wait for the first 30-60 minutes of this session to pass before entering.\n";
+            } elseif ($sessionFilter === 'OPTIMAL') {
+                $sessionBlock .= "✅ OPTIMAL CONDITIONS: London–NY overlap. High liquidity. Breakouts are valid.\n";
+            }
+        }
+
+        // AMD Cycle block (Accumulation-Manipulation-Distribution)
+        $amdData  = $data['amd_analysis'] ?? null;
+        $amdBlock = '';
+        if ($amdData && !empty($amdData['manipulation_detected'])) {
+            $manip = $amdData['manipulation'];
+            $amdBlock = "\n🎯 AMD CYCLE: " . strtoupper($amdData['expected_direction']) . " distribution expected "
+                      . "(accumulation \${$amdData['accumulation']['low']}-\${$amdData['accumulation']['high']}, "
+                      . strtoupper($manip['direction']) . " sweep at {$manip['time']} {$manip['session']} open)\n"
+                      . "  Treat this as an additional confirmation signal only — do not treat it as a core requirement.\n";
+        }
+
+        // ATR SL guidance line
+        $atrRaw   = $data['classical']['atr']['current'] ?? null;
+        $atrBlock = '';
+        $sl15x    = 'N/A'; // fallback if ATR unavailable
+        if ($atrRaw && ($data['current_price'] ?? 0) > 0) {
+            $atrPct   = round(($atrRaw / $data['current_price']) * 100, 3);
+            $sl15x    = round($atrRaw * 1.5, 8);
+            $sl2x     = round($atrRaw * 2.0, 8);
+            $atrBlock = "\nATR SL Guide: ATR={$atr} ({$atrPct}% of price). Recommended SL = Entry ± 1.5×ATR (\${$sl15x}). Volatility SL = Entry ± 2×ATR (\${$sl2x}).\n";
+        }
+
         return <<<PROMPT
 Crypto: {$symbol} | TF: {$timeframe} | Price: {$this->fmtPrice($data['current_price'] ?? 0)} | Bias: {$bias} | Status: {$trendingStatus}
 {$obWarningBlock}
@@ -425,17 +543,21 @@ Fibonacci: {$fibList}
 Volume: POC={$poc} VAH={$vah} VAL={$val}
 Classical: MA={$trend} RSI={$rsi}({$rsiCond}) MACD={$macd} ATR={$atr}
 S/R: Support=[{$sup}] Resistance=[{$res}]
-{$computedConfLine}
-
+{$computedConfLine}{$newsBlock}{$filterBlock}{$sessionBlock}{$amdBlock}{$atrBlock}
 RULES:
 - If market is 'squeezed' or 'ranging' (strong resistance above and support below), DO NOT default to WAIT. Look for high-probability SCALPING / COUNTER-TREND trades (e.g. shorting resistance, buying support) if the Risk/Reward is at least {$minRR}.
+
 - BUY/SELL only if >= {$minConf} confluences from DIFFERENT schools.
 - R:R >= 1:{$minRR} (use TP2 for reward calc).
 - entry_price within 0.5% of current price.
-- ⚠️ If price is inside a BEARISH OB zone, or directly below a BLOCKING Bearish FVG, you MUST output WAIT or SELL — never BUY.
+- Price inside a BEARISH OB zone is a caution flag, not an automatic veto — a real-data backtest (747 bullish signals) found no significant win-rate difference vs. being outside one (94.7% vs 96.7%). Weigh it with other confluences instead of auto-rejecting the BUY. If price is directly below a BLOCKING Bearish FVG, you MUST still output WAIT or SELL — never BUY (not separately tested, still a hard rule).
+- ⚠️ VOLUME & FAKE PUMP CHECK: If you detect a sudden pump/dump but volume is poor or Volume Profile status indicates weakness/fake pump, you MUST reject the trade and output WAIT to avoid liquidity sweeps.
 - Place SL behind nearest invalidation structure (OB/Swing High/Low) + ATR buffer. Max SL: {$slPct}%.
+- ⚠️ CRITICAL SL RULE: The SL distance from entry MUST be >= 1.5× ATR. Current ATR = {$atr}. Minimum SL distance = {$sl15x}. NEVER suggest an SL closer than this — a tighter SL will be hit by normal market noise before the trade plays out, regardless of the signal quality.
+- ⚠️ PRICE DISCOVERY SL RULE: If the coin is in Price Discovery (breaking all-time highs with no resistance above) and 1h support is too far or weak, DO NOT rely purely on fragile 1h FVGs for Stop Loss. Use a wider ATR multiplier (e.g., 2x ATR) to avoid getting stopped out by fakeout wicks.
 - TP1/TP2/TP3 aligned with FVG, POC/VAH/VAL, or S/R levels. Max TP3 distance: {$maxTpPct}%.
 - Your "confidence" must be grounded in the pre-computed technical confidence above.
+- ⚠️ When writing reasoning, clearly distinguish between individual indicator trends and overall bias (e.g. say 'despite an uptrend in MA, the overall bias remains bearish' instead of 'uptrend with a bearish bias').
 
 Respond ONLY with this JSON (no markdown):
 {"action":"BUY|SELL|WAIT","entry_price":0.0,"tp1":0.0,"tp2":0.0,"tp3":0.0,"sl":0.0,"risk_reward":"1:X","confidence":0,"reasoning":"...","confluences":["..."],"invalidation":"..."}
@@ -518,6 +640,15 @@ PROMPT;
             ? "✅ ALL 3 TIMEFRAMES ALIGNED: {$htfBias}"
             : "⚠️ MIXED BIAS: HTF={$htfBias} MTF={$mtfBias} LTF={$ltfBias}";
 
+        $newsData = $ltfData['specific_news'] ?? [];
+        $newsBlock = '';
+        if (!empty($newsData)) {
+            $newsBlock = "\n📰 LATEST FUNDAMENTAL NEWS (LAST 24H):\n";
+            foreach ($newsData as $n) {
+                $newsBlock .= "- [" . strtoupper($n['sentiment']) . "] " . $n['title'] . "\n";
+            }
+        }
+
         return <<<PROMPT
 Multi-Timeframe Analysis for {$symbol} | Entry TF: {$ltfTf} | Price: \${$price}
 Bias Alignment: {$biasAlignment}
@@ -526,7 +657,7 @@ TOP-DOWN DATA:
 {$htfLine}
 {$mtfLine}
 {$ltfLine}
-
+{$newsBlock}
 RULES:
 - Use HTF [{$htfTf}] for bias direction only.
 - Use MTF [{$mtfTf}] to identify OB/FVG confluence zones.
@@ -535,13 +666,14 @@ RULES:
 - If biases conflict, output WAIT.
 - entry_price within 0.5% of {$price}.
 - If market is 'squeezed' or 'ranging' (strong resistance above and support below), DO NOT default to WAIT. Look for high-probability SCALPING / COUNTER-TREND trades (e.g. shorting resistance, buying support) if the Risk/Reward is at least {$minRR}.
-- NEVER issue a BUY if price is inside a Bearish OB or directly underneath a BLOCKING Bearish FVG.
+- Price inside a Bearish OB is a caution flag, not an automatic veto — a real-data backtest found no significant win-rate difference vs. being outside one; weigh it alongside other confluences instead of auto-rejecting the BUY. NEVER issue a BUY if price is directly underneath a BLOCKING Bearish FVG (not separately tested, still a hard rule).
 - Minimum required confluences: {$minConf}.
 - Minimum risk-reward ratio: {$minRR}.
 - Max TP distance: {$maxTpPct}%.
 - Max SL distance: {$slPct}%.
 - Ensure TP values are logically ordered. (TP1 < TP2 < TP3 for BUY, opposite for SELL).
 - Ensure SL is beyond local structure (use ATR and OB/FVG buffers).
+- ⚠️ When writing reasoning, clearly distinguish between individual indicator trends and overall bias (e.g. say 'despite an uptrend in MA, the overall bias remains bearish' instead of 'uptrend with a bearish bias').
 - Use strict JSON format ONLY. No markdown, no explanations outside the JSON object.
 {"action":"BUY|SELL|WAIT","entry_price":0.0,"tp1":0.0,"tp2":0.0,"tp3":0.0,"sl":0.0,"risk_reward":"1:X","confidence":0,"reasoning":"...","confluences":["..."],"invalidation":"..."}
 PROMPT;

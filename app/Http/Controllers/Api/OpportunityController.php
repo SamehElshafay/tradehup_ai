@@ -7,13 +7,28 @@ use Illuminate\Http\JsonResponse;
 
 class OpportunityController extends Controller {
     public function index(Request $request): JsonResponse {
+        $minConfidence = $request->get('min_confidence', 60);
+        $action        = $request->get('action');
+        $timeframe     = $request->get('timeframe');
+        $perPage       = $request->get('per_page', 50); // increased default to show all
+
         $query = Recommendation::with(['coin', 'analysis'])
-            ->where('status', 'active')
+            // Show active AND recently-expired (within last 2h) so short-TF (5m/15m) trades
+            // don't vanish from the list before the user gets a chance to see them
+            ->where(function ($q) {
+                $q->where('status', 'active')
+                  ->orWhere(function ($q2) {
+                      $q2->where('status', 'expired')
+                         ->where('updated_at', '>=', now()->subHours(2));
+                  });
+            })
             ->where('action', '!=', 'WAIT')
-            ->where('confidence', '>=', $request->get('min_confidence', 60));
-        if ($action = $request->get('action')) $query->where('action', $action);
-        if ($timeframe = $request->get('timeframe')) $query->where('timeframe', $timeframe);
-        $opportunities = $query->orderByDesc('confidence')->paginate($request->get('per_page', 20));
+            ->where('confidence', '>=', $minConfidence);
+
+        if ($action)    $query->where('action', $action);
+        if ($timeframe) $query->where('timeframe', $timeframe);
+
+        $opportunities = $query->orderByDesc('confidence')->orderByDesc('created_at')->paginate($perPage);
         return response()->json($opportunities);
     }
 

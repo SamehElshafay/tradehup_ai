@@ -7,7 +7,7 @@ class Recommendation extends Model {
         'coin_id', 'analysis_id', 'timeframe', 'action', 'entry_price',
         'tp1', 'tp2', 'tp3', 'sl', 'risk_reward', 'confidence', 'reasoning',
         'confluences', 'invalidation', 'sentiment_score', 'whale_activity', 'liquidity_data',
-        'ai_model', 'mtf_mode', 'mtf_timeframes', 'status', 'expires_at'
+        'ai_model', 'strategy', 'mtf_mode', 'mtf_timeframes', 'status', 'expires_at'
     ];
     protected $casts = [
         'entry_price' => 'float', 'tp1' => 'float', 'tp2' => 'float',

@@ -80,10 +80,14 @@ class RecommendationController extends Controller {
     public function latest(Request $request, string $symbol): JsonResponse {
         $coin = Coin::where('symbol', strtoupper($symbol))->firstOrFail();
         $timeframe = $request->get('timeframe', '4h');
-        $rec = Recommendation::where('coin_id', $coin->id)
-            ->where('timeframe', $timeframe)
-            ->where('status', 'active')
-            ->latest()->first();
+        $query = Recommendation::where('coin_id', $coin->id);
+        
+        if ($timeframe !== 'all') {
+            $query->where('timeframe', $timeframe);
+        }
+        
+        // Don't force 'active' status for the latest report viewing
+        $rec = $query->latest()->first();
         if (!$rec) return response()->json(['message' => 'No active recommendation found'], 404);
         return response()->json(['recommendation' => $rec]);
     }

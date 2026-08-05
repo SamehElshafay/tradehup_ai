@@ -18,7 +18,7 @@ class TradeTargetHit implements ShouldBroadcastNow
     public float $profit; // PnL percentage or amount
     public string $message; // Ready-made notification text
 
-    public function __construct(string $symbol, string $type, string $target, float $profit)
+    public function __construct(string $symbol, string $type, string $target, float $profit, ?string $strategy = null)
     {
         $this->symbol = $symbol;
         $this->type = $type;
@@ -27,11 +27,12 @@ class TradeTargetHit implements ShouldBroadcastNow
         
         $actionText = $type === 'BUY' ? 'LONG' : 'SHORT';
         $targetText = strtoupper($target);
+        $strategyText = $strategy ? " ({$strategy})" : "";
         
         if ($target === 'sl') {
-            $this->message = "🚨 {$symbol} {$actionText} hit Stop Loss! ({$this->profit}%)";
+            $this->message = "🚨 {$symbol} {$actionText}{$strategyText} hit Stop Loss! ({$this->profit}%)";
         } else {
-            $this->message = "🎯 {$symbol} {$actionText} hit {$targetText}! Profit: {$this->profit}%";
+            $this->message = "🎯 {$symbol} {$actionText}{$strategyText} hit {$targetText}! Profit: {$this->profit}%";
         }
     }
 

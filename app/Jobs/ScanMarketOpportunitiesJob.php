@@ -44,44 +44,86 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
         event(new MarketScanProgress('Starting automated market opportunity scan...', 'info'));
         Log::info('Starting automated market opportunity scan...', ['timeframe' => $timeframe]);
         try {
-            // 1. Get Top Trending Coins
-            event(new MarketScanProgress('Looking for trending coins...', 'info'));
-            $trendingSymbols = $scanner->getTrendingCoins(15); // Scan top 15 trending coins
+            // Read settings
+            $settingsFile = storage_path('app/ai_settings.json');
+            $settings = file_exists($settingsFile) ? json_decode(file_get_contents($settingsFile), true) : [];
+            
+            $trendEnabled   = $settings['strategy_trending_enabled'] ?? true;
+            $trendLimit     = (int) ($settings['strategy_trending_limit'] ?? 20);
+            
+            $volEnabled     = $settings['strategy_volume_enabled'] ?? true;
+            $volLimit       = (int) ($settings['strategy_volume_limit'] ?? 10);
+            
+            $earlyEnabled   = $settings['strategy_early_enabled'] ?? true;
+            $earlyLimit     = (int) ($settings['strategy_early_limit'] ?? 10);
+            
+            $revEnabled     = $settings['strategy_reversal_enabled'] ?? true;
+            $revLimit       = (int) ($settings['strategy_reversal_limit'] ?? 10);
 
-            if (empty($trendingSymbols)) {
-                event(new MarketScanProgress('No trending coins found to scan.', 'warning'));
-                Log::info('No trending coins found to scan.');
+            $activeStrategies = [];
+            if ($trendEnabled) $activeStrategies[] = 'Trending';
+            if ($volEnabled)   $activeStrategies[] = 'Volume Anomaly';
+            if ($earlyEnabled) $activeStrategies[] = 'Early Mover';
+            if ($revEnabled)   $activeStrategies[] = 'Reversal Catcher';
+            
+            $strategiesStr = empty($activeStrategies) ? 'None' : implode(', ', $activeStrategies);
+
+            // 1. Get Coins to Scan
+            event(new MarketScanProgress("Scanning for opportunities using: $strategiesStr...", 'info'));
+            
+            $trendingCoins = $trendEnabled ? $scanner->getTrendingCoins($trendLimit) : [];
+            $binanceCoins  = $scanner->getBinanceOpportunities(
+                $volLimit, $earlyLimit, $revLimit,
+                $volEnabled, $earlyEnabled, $revEnabled
+            );
+            
+            // Merge and deduplicate by symbol (preferring new strategies over 'Old')
+            $merged = [];
+            foreach (array_merge($trendingCoins, $binanceCoins) as $item) {
+                $sym = $item['symbol'];
+                if (!isset($merged[$sym]) || $merged[$sym]['strategy'] === 'Old') {
+                    $merged[$sym] = $item;
+                }
+            }
+            $coinsToScan = array_values($merged);
+
+            if (empty($coinsToScan)) {
+                event(new MarketScanProgress('No coins found to scan.', 'warning'));
+                Log::info('No coins found to scan.');
                 return;
             }
 
-            // 1.5. Cross-check against real Binance liquid pairs — drops trending tickers that
+            // 1.5. Cross-check against real Binance liquid pairs — drops tickers that
             // don't actually have a liquid USDT pair (ticker collisions, delisted, illiquid).
             $liquidSymbols = $this->getLiquidBinanceSymbols($taService);
-            $validSymbols  = array_values(array_filter(
-                $trendingSymbols,
-                fn($symbol) => isset($liquidSymbols[$symbol])
+            $validCoins = array_values(array_filter(
+                $coinsToScan,
+                fn($item) => isset($liquidSymbols[$item['symbol']])
             ));
-            $skipped = array_diff($trendingSymbols, $validSymbols);
+
+            $skipped = array_diff(array_column($coinsToScan, 'symbol'), array_column($validCoins, 'symbol'));
             if (!empty($skipped)) {
-                Log::info('Skipping trending symbols without a liquid Binance USDT pair', ['skipped' => array_values($skipped)]);
-                event(new MarketScanProgress('Skipped ' . count($skipped) . ' trending coin(s) with no liquid Binance pair: ' . implode(', ', $skipped), 'warning'));
+                Log::info('Skipping symbols without a liquid Binance USDT pair', ['skipped' => array_values($skipped)]);
+                event(new MarketScanProgress('Skipped ' . count($skipped) . ' coin(s) with no liquid Binance pair: ' . implode(', ', $skipped), 'warning'));
             }
 
-            if (empty($validSymbols)) {
-                event(new MarketScanProgress('No liquid trending coins left to scan after filtering.', 'warning'));
-                Log::info('No liquid trending coins left to scan.');
+            if (empty($validCoins)) {
+                event(new MarketScanProgress('No liquid coins left to scan after filtering.', 'warning'));
+                Log::info('No liquid coins left to scan.');
                 return;
             }
-            $trendingSymbols = $validSymbols;
+            $coinsToScan = $validCoins;
 
-            event(new MarketScanProgress('Found ' . count($trendingSymbols) . ' trending coins to analyze.', 'success'));
-            Log::info('Found trending coins', ['symbols' => $trendingSymbols]);
+            event(new MarketScanProgress("Found " . count($coinsToScan) . " coins to analyze using: $strategiesStr.", 'success'));
+            Log::info('Found coins to analyze', ['coins' => $coinsToScan]);
 
-            $totalCoins = count($trendingSymbols);
+            $totalCoins = count($coinsToScan);
             $currentIndex = 1;
             $pendingAntigravityJobs = [];
 
-            foreach ($trendingSymbols as $symbol) {
+            foreach ($coinsToScan as $coinItem) {
+                $symbol = $coinItem['symbol'];
+                $strategy = $coinItem['strategy'];
                 if (\Illuminate\Support\Facades\Cache::pull('stop_ai_scan')) {
                     Log::info('Market scan was halted by user.');
                     event(new MarketScanCompleted('Market scan was halted by user.'));
@@ -112,9 +154,21 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
 
                 // 3. Trigger analysis for this trending coin, on the user-configured scan timeframe
                 $request = new Request();
-                $request->merge(['is_trending' => true]);
+                $request->merge(['is_trending' => true, 'strategy' => $strategy]);
 
-                event(new MarketScanProgress("Analyzing {$symbol} ({$timeframe}) with AI... ({$currentIndex}/{$totalCoins})", 'info', $symbol));
+                $settingsFile = storage_path('app/ai_settings.json');
+                $displayTimeframe = $timeframe;
+                if (file_exists($settingsFile)) {
+                    $settings = json_decode(file_get_contents($settingsFile), true);
+                    $htfTf = $settings['mtf_htf'] ?? null;
+                    $mtfTf = $settings['mtf_mtf'] ?? null;
+                    $ltfTf = $settings['mtf_ltf'] ?? null;
+                    if ($htfTf && $mtfTf && $ltfTf && $htfTf !== $mtfTf && $mtfTf !== $ltfTf && $htfTf !== $ltfTf) {
+                        $displayTimeframe = "MTF: {$htfTf}→{$mtfTf}→{$ltfTf}";
+                    }
+                }
+
+                event(new MarketScanProgress("Analyzing {$symbol} ({$displayTimeframe}) with AI... ({$currentIndex}/{$totalCoins})", 'info', $symbol, null, null, null, $strategy));
                 Log::info("Analyzing trending coin: {$symbol}", ['timeframe' => $timeframe]);
 
                 try {
@@ -127,18 +181,24 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
                             'symbol' => $symbol,
                             'timeframe' => $timeframe,
                             'request_id' => $data['request_id'],
+                            'strategy' => $strategy,
                         ];
                     } else {
                         if ($response->getStatusCode() === 200) {
                             $hasOpp = (isset($data['recommendation']) && $data['recommendation']['action'] !== 'WAIT') ? 'Yes!' : 'No';
-                            event(new MarketScanProgress("Successfully analyzed {$symbol}. Found opportunity? {$hasOpp}", 'success', $symbol));
+                            $action = $data['recommendation']['action'] ?? 'WAIT';
+                            $analysisId = $data['id'] ?? null; // Assuming analysis ID is returned in $data['id']
+                            
+                            event(new MarketScanProgress("Successfully analyzed {$symbol}. Found opportunity? {$hasOpp}", 'success', $symbol, $action, $analysisId, null, $strategy));
                             Log::info("Successfully analyzed trending coin: {$symbol}");
                         } else {
-                            event(new MarketScanProgress("Failed to analyze {$symbol}.", 'warning', $symbol));
+                            $errorMsg = $data['message'] ?? $data['error'] ?? 'Unknown error';
+                            event(new MarketScanProgress("Failed to analyze {$symbol}.", 'warning', $symbol, 'ERROR', null, $errorMsg, $strategy));
                             Log::warning("Failed to analyze trending coin: {$symbol}");
                         }
                     }
                 } catch (\Exception $e) {
+                    event(new MarketScanProgress("Failed to analyze {$symbol}. System Error.", 'warning', $symbol, 'ERROR', null, $e->getMessage(), $strategy));
                     Log::error("Error analyzing trending coin {$symbol}", ['error' => $e->getMessage()]);
                 }
                 
@@ -174,9 +234,10 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
                         $symbol = $job['symbol'];
                         $timeframe = $job['timeframe'];
                         $requestId = $job['request_id'];
+                        $strategy = $job['strategy'];
                         
                         $request = new Request();
-                        $request->merge(['is_trending' => true]);
+                        $request->merge(['is_trending' => true, 'strategy' => $strategy]);
                         
                         try {
                             $statusResponse = $analyzer->bridgeStatus($request, $symbol, $timeframe, $requestId);
@@ -185,11 +246,15 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
                             if (isset($statusData['status'])) {
                                 if ($statusData['status'] === 'completed') {
                                     $hasOpp = (isset($statusData['recommendation']) && $statusData['recommendation']['action'] !== 'WAIT') ? 'Yes!' : 'No';
-                                    event(new MarketScanProgress("Successfully analyzed {$symbol} with Antigravity AI. Found opportunity? {$hasOpp}", 'success', $symbol));
+                                    $action = $statusData['recommendation']['action'] ?? 'WAIT';
+                                    $analysisId = $statusData['id'] ?? null;
+                                    
+                                    event(new MarketScanProgress("Successfully analyzed {$symbol} with Antigravity AI. Found opportunity? {$hasOpp}", 'success', $symbol, $action, $analysisId, null, $strategy));
                                     Log::info("Successfully analyzed trending coin: {$symbol} via Antigravity");
                                     unset($pendingAntigravityJobs[$index]);
                                 } elseif ($statusData['status'] === 'failed') {
-                                    event(new MarketScanProgress("Antigravity AI failed to analyze {$symbol}.", 'error', $symbol));
+                                    $errorMsg = $statusData['error'] ?? 'Antigravity AI failed.';
+                                    event(new MarketScanProgress("Antigravity AI failed to analyze {$symbol}.", 'error', $symbol, 'ERROR', null, $errorMsg, $strategy));
                                     Log::error("Antigravity AI failed to analyze trending coin: {$symbol}");
                                     unset($pendingAntigravityJobs[$index]);
                                 }
@@ -234,7 +299,7 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
      * Binance pair (ticker collisions, delisted symbols, or too illiquid to trade safely).
      */
     private function getLiquidBinanceSymbols(PythonTAService $taService): array {
-        $topCoins = $taService->getTopCoins(300);
+        $topCoins = $taService->getTopCoins(1000);
         $map = [];
         foreach ($topCoins as $coin) {
             if (($coin['volume_24h'] ?? 0) >= self::MIN_VOLUME_USDT) {
