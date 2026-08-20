@@ -124,15 +124,17 @@ ok "Redis: $(redis-cli ping 2>/dev/null || echo 'starting...')"
 log "6. Nginx"
 # ═══════════════════════════════════════════════════════════════════════════════
 if ! command -v nginx &>/dev/null; then
-    dnf install -y nginx
+    dnf install -y nginx 2>/dev/null || warn "Could not install Nginx via dnf"
 fi
-systemctl enable nginx
+
+mkdir -p /etc/nginx/conf.d/
 
 # Find PHP-FPM socket
 PHP_SOCK=$(find /run /var/run /tmp -name "*.sock" 2>/dev/null | grep -i php | head -1 || echo "/run/php-fpm/www.sock")
 warn "PHP-FPM socket: $PHP_SOCK"
 
-cat > /etc/nginx/conf.d/ai-trading.conf << NGINX_EOF
+if [ -d "/etc/nginx/conf.d" ]; then
+    cat > /etc/nginx/conf.d/ai-trading.conf << NGINX_EOF
 server {
     listen 80;
     server_name ${SERVER_IP} _;
@@ -165,8 +167,12 @@ server {
 }
 NGINX_EOF
 
-systemctl start nginx
-nginx -t 2>/dev/null && systemctl reload nginx && ok "Nginx configured" || warn "Nginx config issue"
+    systemctl enable nginx 2>/dev/null || true
+    systemctl start nginx 2>/dev/null || true
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null && ok "Nginx configured" || warn "Nginx could not start (likely port conflict with LiteSpeed/cPanel). You can configure your website root via cPanel/LiteSpeed to: ${PROJECT_DIR}/public"
+else
+    warn "Nginx config folder not found. Assuming you are using LiteSpeed or another web server."
+fi
 
 # SELinux
 setsebool -P httpd_can_network_connect 1 2>/dev/null || true
@@ -177,6 +183,7 @@ firewall-cmd --permanent --add-service=http 2>/dev/null || true
 firewall-cmd --permanent --add-port=8001/tcp 2>/dev/null || true
 firewall-cmd --permanent --add-port=8080/tcp 2>/dev/null || true
 firewall-cmd --reload 2>/dev/null || true
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 log "7. Python 3.11"
