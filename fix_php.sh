@@ -342,8 +342,8 @@ log "9. Python TA Service"
 cd "$PYTHON_DIR"
 rm -rf venv
 $PYTHON_BIN -m venv venv
-./venv/bin/pip install --no-cache-dir --upgrade pip -q
-./venv/bin/pip install --no-cache-dir -r requirements.txt
+./venv/bin/pip install --no-cache-dir -i https://pypi.org/simple/ --upgrade pip -q
+./venv/bin/pip install --no-cache-dir -i https://pypi.org/simple/ -r requirements.txt
 
 cat > .env << PYENV_EOF
 BINANCE_API_KEY=
