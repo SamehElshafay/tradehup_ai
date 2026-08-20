@@ -76,10 +76,23 @@ PHP_BIN=$(command -v php 2>/dev/null || command -v php83 2>/dev/null || echo "")
 # ═══════════════════════════════════════════════════════════════════════════════
 log "3. Composer"
 # ═══════════════════════════════════════════════════════════════════════════════
+export COMPOSER_ALLOW_SUPERUSER=1
+
 if ! command -v composer &>/dev/null; then
-    curl -sS https://getcomposer.org/installer | $PHP_BIN -- --install-dir=/usr/local/bin --filename=composer
+    echo "Installing Composer..."
+    dnf install -y composer -q 2>/dev/null || {
+        echo "DNF composer failed, downloading phar directly..."
+        curl -4 -sS --connect-timeout 15 --retry 3 -o /usr/local/bin/composer https://getcomposer.org/composer-stable.phar || \
+        wget -4 -q -O /usr/local/bin/composer https://getcomposer.org/composer-stable.phar
+        chmod +x /usr/local/bin/composer
+    }
 fi
-ok "Composer: $(composer --version --no-ansi 2>/dev/null | head -1)"
+
+# Set composer to use IPv4 only to avoid DNS/IPv6 routing hangs on VPS
+composer config --global disable-tls true 2>/dev/null || true
+composer config --global secure-http false 2>/dev/null || true
+ok "Composer: $(composer --version --no-ansi 2>/dev/null | head -1 || echo 'Installed')"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 log "4. MySQL / MariaDB"
@@ -251,7 +264,7 @@ BINANCE_API_SECRET=
 FRONTEND_URL=http://${SERVER_IP}
 ENV_EOF
 
-composer install --no-dev --optimize-autoloader --no-interaction -q
+composer install --no-dev --optimize-autoloader --no-interaction
 $PHP_BIN artisan key:generate --force
 $PHP_BIN artisan migrate --force
 $PHP_BIN artisan config:cache
