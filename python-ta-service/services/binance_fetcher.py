@@ -57,37 +57,43 @@ def fetch_ohlcv(symbol: str, exchange: str = "binance", interval: str = "4h", li
 
 
 def _fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Fetch OHLCV from Binance REST API.
+    """Fetch OHLCV from Binance REST API with multi-endpoint fallback to bypass geoblocking."""
+    endpoints = [
+        "https://api.binance.com",
+        "https://api3.binance.com",
+        "https://api-gcp.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com"
+    ]
+    
+    last_error = None
+    for base in endpoints:
+        url = f"{base}/api/v3/klines"
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit + 1}
+        headers = {}
+        if BINANCE_API_KEY:
+            headers["X-MBX-APIKEY"] = BINANCE_API_KEY
 
-    Requests one extra candle and drops it — Binance always returns the
-    still-forming (open) candle last, and every indicator here (volume_ratio,
-    ATR, RSI, MACD, BB, structure) must be computed on CLOSED bars only. A
-    partial candle's volume can read anywhere from 0% to ~100% of a full
-    bar's depending on how many seconds have elapsed since it opened, which
-    was silently corrupting volume_ratio (observed median 0.36 across a live
-    scan instead of the expected ~1.0) and made volume-spike detection nearly
-    unreachable.
-    """
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit + 1}
-    headers = {}
-    if BINANCE_API_KEY:
-        headers["X-MBX-APIKEY"] = BINANCE_API_KEY
-
-    response = requests.get(url, params=params, headers=headers, timeout=10, verify=False)
-    response.raise_for_status()
-    raw = response.json()
-
-    df = pd.DataFrame(raw, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-    df = df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].copy()
-    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
-    return df.iloc[:-1].reset_index(drop=True)  # drop the still-forming last candle
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=5, verify=False)
+            response.raise_for_status()
+            raw = response.json()
+            
+            df = pd.DataFrame(raw, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_volume", "trades",
+                "taker_buy_base", "taker_buy_quote", "ignore"
+            ])
+            df = df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].copy()
+            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col])
+            return df.iloc[:-1].reset_index(drop=True)
+        except Exception as e:
+            last_error = e
+            continue
+            
+    raise last_error
 
 
 def _fetch_bybit(symbol: str, interval: str, limit: int) -> pd.DataFrame:
