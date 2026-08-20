@@ -38,6 +38,8 @@ Implementation notes:
   - BOS: taken from SMC market_structure to avoid re-computation.
 """
 
+from __future__ import annotations
+
 import pandas as pd
 import numpy as np
 
@@ -61,7 +63,7 @@ ATR_TRENDING_MIN_SCALPING = 0.12  # 5m ATR% reads far lower than swing TFs —
 SCALPING_TIMEFRAMES = ("1m", "5m")
 
 
-def detect_market_regime(df: pd.DataFrame, classical: dict, smc: dict, timeframe: str | None = None) -> dict:
+def detect_market_regime(df: pd.DataFrame, classical: dict, smc: dict, timeframe=None) -> dict:
     """
     Main entry point. Returns regime classification with modifiers.
     """

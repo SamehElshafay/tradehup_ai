@@ -17,6 +17,7 @@ Weight scheme — dynamic redistribution when Harmonic has no signal:
 With Harmonic active:    Classical 30% | SMC 20% | Harmonic 35% | Volume 15%
 Without Harmonic signal: Classical 50% | SMC 30% | Volume 20%
 """
+from __future__ import annotations
 
 
 MAX_CONFIDENCE = 90          # 100% is never statistically valid
@@ -28,9 +29,9 @@ def compute_overall_bias(
     smc: dict,
     harmonic: dict,
     volume: dict,
-    market_regime: dict | None = None,
-    classical_patterns: list | None = None,
-    harmonic_patterns: list | None = None,
+    market_regime=None,
+    classical_patterns=None,
+    harmonic_patterns=None,
 ) -> tuple:
     """Returns (overall_bias: str, overall_confidence: int, score_breakdown: dict)."""
 
