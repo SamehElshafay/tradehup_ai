@@ -46,6 +46,7 @@ class ReportController extends Controller {
         $rows = Recommendation::with('coin:id,symbol')
             ->select('coin_id')
             ->whereBetween('created_at', [$todayStart, $todayEnd])
+            ->whereIn('action', ['BUY', 'SELL'])
             ->get();
 
         // Build symbol => count map
