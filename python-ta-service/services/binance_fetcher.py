@@ -49,51 +49,45 @@ def fetch_ohlcv(symbol: str, exchange: str = "binance", interval: str = "4h", li
     elif exchange == "mexc":
         df = _fetch_mexc(symbol, interval, limit)
     else:
-        # Default: Binance
-        df = _fetch_binance(symbol, interval, limit)
+        # Default: Binance (redirected to MEXC due to Binance geoblocking on the VPS)
+        df = _fetch_mexc(symbol, interval, limit)
 
     _set_cache(key, df.to_dict("records"))
     return df
 
 
 def _fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Fetch OHLCV from Binance REST API with multi-endpoint fallback to bypass geoblocking."""
-    endpoints = [
-        "https://api.binance.com",
-        "https://api3.binance.com",
-        "https://api-gcp.binance.com",
-        "https://api1.binance.com",
-        "https://api2.binance.com"
-    ]
-    
-    last_error = None
-    for base in endpoints:
-        url = f"{base}/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit + 1}
-        headers = {}
-        if BINANCE_API_KEY:
-            headers["X-MBX-APIKEY"] = BINANCE_API_KEY
+    """Fetch OHLCV from Binance REST API.
 
-        try:
-            response = requests.get(url, params=params, headers=headers, timeout=5, verify=False)
-            response.raise_for_status()
-            raw = response.json()
-            
-            df = pd.DataFrame(raw, columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "quote_volume", "trades",
-                "taker_buy_base", "taker_buy_quote", "ignore"
-            ])
-            df = df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].copy()
-            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col])
-            return df.iloc[:-1].reset_index(drop=True)
-        except Exception as e:
-            last_error = e
-            continue
-            
-    raise last_error
+    Requests one extra candle and drops it — Binance always returns the
+    still-forming (open) candle last, and every indicator here (volume_ratio,
+    ATR, RSI, MACD, BB, structure) must be computed on CLOSED bars only. A
+    partial candle's volume can read anywhere from 0% to ~100% of a full
+    bar's depending on how many seconds have elapsed since it opened, which
+    was silently corrupting volume_ratio (observed median 0.36 across a live
+    scan instead of the expected ~1.0) and made volume-spike detection nearly
+    unreachable.
+    """
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit + 1}
+    headers = {}
+    if BINANCE_API_KEY:
+        headers["X-MBX-APIKEY"] = BINANCE_API_KEY
+
+    response = requests.get(url, params=params, headers=headers, timeout=10, verify=False)
+    response.raise_for_status()
+    raw = response.json()
+
+    df = pd.DataFrame(raw, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+    df = df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].copy()
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col])
+    return df.iloc[:-1].reset_index(drop=True)  # drop the still-forming last candle
 
 
 def _fetch_bybit(symbol: str, interval: str, limit: int) -> pd.DataFrame:
@@ -174,16 +168,16 @@ def fetch_ticker_price(symbol: str, exchange: str = "binance") -> float:
         return float(response.json()["price"])
 
     else:
-        # Default: Binance
-        url = "https://api.binance.com/api/v3/ticker/price"
+        # Default: Binance (redirected to MEXC due to Binance geoblocking on the VPS)
+        url = "https://api.mexc.com/api/v3/ticker/price"
         response = requests.get(url, params={"symbol": symbol.upper()}, timeout=5, verify=False)
         response.raise_for_status()
         return float(response.json()["price"])
 
 
 def fetch_top_coins(limit: int = 50) -> list:
-    """Fetch top trading pairs by volume (USDT pairs only) from Binance."""
-    url = "https://api.binance.com/api/v3/ticker/24hr"
+    """Fetch top trading pairs by volume (USDT pairs only) from Binance (redirected to MEXC)."""
+    url = "https://api.mexc.com/api/v3/ticker/24hr"
     response = requests.get(url, timeout=10, verify=False)
     response.raise_for_status()
     all_tickers = response.json()
