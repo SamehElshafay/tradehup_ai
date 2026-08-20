@@ -27,7 +27,7 @@ def _fetch_ohlcv_paginated(symbol: str, interval: str, days: int) -> pd.DataFram
     rather than fine-grained recent resolution. Bypasses the shared cache
     (one-off deep historical pull, not something live callers need cached).
     """
-    url = "https://api.mexc.com/api/v3/klines"
+    url = "https://api.binance.com/api/v3/klines"
     frames = []
     end_time = None
     calls_needed = max(1, -(-days * 288 // 1000))  # 288 5m-candles/day, ceil div

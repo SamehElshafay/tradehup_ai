@@ -10,7 +10,7 @@ log()  { echo -e "\n${CYAN}━━━ $1 ${NC}"; }
 ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
 warn() { echo -e "  ${YELLOW}⚠${NC}  $1"; }
 
-PROJECT_DIR="/var/www/ai-trading"
+PROJECT_DIR="/www/wwwroot/ai-trading"
 PYTHON_DIR="$PROJECT_DIR/python-ta-service"
 SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 

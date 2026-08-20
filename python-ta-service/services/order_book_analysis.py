@@ -54,8 +54,8 @@ def fetch_order_book(symbol: str, exchange: str = "binance") -> dict:
             return {"bids": raw.get("bids", []), "asks": raw.get("asks", [])}
 
         else:
-            # Default: Binance (redirected to MEXC due to Binance geoblocking on the VPS)
-            url = "https://api.mexc.com/api/v3/depth"
+            # Default: Binance
+            url = "https://api.binance.com/api/v3/depth"
             params = {"symbol": symbol.upper(), "limit": ORDER_BOOK_LIMIT}
             resp = requests.get(url, params=params, timeout=5, verify=False)
             resp.raise_for_status()

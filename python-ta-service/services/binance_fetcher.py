@@ -49,8 +49,8 @@ def fetch_ohlcv(symbol: str, exchange: str = "binance", interval: str = "4h", li
     elif exchange == "mexc":
         df = _fetch_mexc(symbol, interval, limit)
     else:
-        # Default: Binance (redirected to MEXC due to Binance geoblocking on the VPS)
-        df = _fetch_mexc(symbol, interval, limit)
+        # Default: Binance
+        df = _fetch_binance(symbol, interval, limit)
 
     _set_cache(key, df.to_dict("records"))
     return df
@@ -168,16 +168,16 @@ def fetch_ticker_price(symbol: str, exchange: str = "binance") -> float:
         return float(response.json()["price"])
 
     else:
-        # Default: Binance (redirected to MEXC due to Binance geoblocking on the VPS)
-        url = "https://api.mexc.com/api/v3/ticker/price"
+        # Default: Binance
+        url = "https://api.binance.com/api/v3/ticker/price"
         response = requests.get(url, params={"symbol": symbol.upper()}, timeout=5, verify=False)
         response.raise_for_status()
         return float(response.json()["price"])
 
 
 def fetch_top_coins(limit: int = 50) -> list:
-    """Fetch top trading pairs by volume (USDT pairs only) from Binance (redirected to MEXC)."""
-    url = "https://api.mexc.com/api/v3/ticker/24hr"
+    """Fetch top trading pairs by volume (USDT pairs only) from Binance."""
+    url = "https://api.binance.com/api/v3/ticker/24hr"
     response = requests.get(url, timeout=10, verify=False)
     response.raise_for_status()
     all_tickers = response.json()
