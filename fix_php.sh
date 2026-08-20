@@ -121,20 +121,52 @@ systemctl enable redis; systemctl start redis
 ok "Redis: $(redis-cli ping 2>/dev/null || echo 'starting...')"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-log "6. Nginx"
+log "6. Web Server (Apache / Nginx)"
 # ═══════════════════════════════════════════════════════════════════════════════
-if ! command -v nginx &>/dev/null; then
-    dnf install -y nginx 2>/dev/null || warn "Could not install Nginx via dnf"
-fi
 
-mkdir -p /etc/nginx/conf.d/
+# Detect if Apache (httpd) is installed/running
+if command -v httpd &>/dev/null || [ -d "/etc/httpd" ]; then
+    echo "Apache (httpd) detected. Configuring Apache..."
+    
+    # Create Apache config for Laravel
+    cat > /etc/httpd/conf.d/ai-trading.conf << APACHE_EOF
+<VirtualHost *:80>
+    ServerName ${SERVER_IP}
+    DocumentRoot ${PROJECT_DIR}/public
 
-# Find PHP-FPM socket
-PHP_SOCK=$(find /run /var/run /tmp -name "*.sock" 2>/dev/null | grep -i php | head -1 || echo "/run/php-fpm/www.sock")
-warn "PHP-FPM socket: $PHP_SOCK"
+    <Directory ${PROJECT_DIR}/public>
+        Options Indexes FollowSymLinks MultiViews
+        AllowOverride All
+        Require all granted
+    </Directory>
 
-if [ -d "/etc/nginx/conf.d" ]; then
-    cat > /etc/nginx/conf.d/ai-trading.conf << NGINX_EOF
+    # Proxy for Laravel Reverb WebSocket
+    ProxyPreserveHost On
+    ProxyPass /app http://127.0.0.1:8080/app
+    ProxyPassReverse /app http://127.0.0.1:8080/app
+
+    ErrorLog /var/log/httpd/ai-trading-error.log
+    CustomLog /var/log/httpd/ai-trading-access.log combined
+</VirtualHost>
+APACHE_EOF
+
+    systemctl enable httpd 2>/dev/null || true
+    systemctl restart httpd 2>/dev/null && ok "Apache (httpd) configured successfully" || warn "Failed to restart Apache"
+else
+    # Fallback to Nginx
+    echo "Apache not detected. Configuring Nginx..."
+    if ! command -v nginx &>/dev/null; then
+        dnf install -y nginx 2>/dev/null || warn "Could not install Nginx via dnf"
+    fi
+
+    mkdir -p /etc/nginx/conf.d/
+
+    # Find PHP-FPM socket
+    PHP_SOCK=$(find /run /var/run /tmp -name "*.sock" 2>/dev/null | grep -i php | head -1 || echo "/run/php-fpm/www.sock")
+    warn "PHP-FPM socket: $PHP_SOCK"
+
+    if [ -d "/etc/nginx/conf.d" ]; then
+        cat > /etc/nginx/conf.d/ai-trading.conf << NGINX_EOF
 server {
     listen 80;
     server_name ${SERVER_IP} _;
@@ -167,12 +199,14 @@ server {
 }
 NGINX_EOF
 
-    systemctl enable nginx 2>/dev/null || true
-    systemctl start nginx 2>/dev/null || true
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null && ok "Nginx configured" || warn "Nginx could not start (likely port conflict with LiteSpeed/cPanel). You can configure your website root via cPanel/LiteSpeed to: ${PROJECT_DIR}/public"
-else
-    warn "Nginx config folder not found. Assuming you are using LiteSpeed or another web server."
+        systemctl enable nginx 2>/dev/null || true
+        systemctl start nginx 2>/dev/null || true
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null && ok "Nginx configured" || warn "Nginx could not start (likely port conflict with LiteSpeed/cPanel). You can configure your website root via cPanel/LiteSpeed to: ${PROJECT_DIR}/public"
+    else
+        warn "Nginx config folder not found. Assuming you are using LiteSpeed or another web server."
+    fi
 fi
+
 
 # SELinux
 setsebool -P httpd_can_network_connect 1 2>/dev/null || true
