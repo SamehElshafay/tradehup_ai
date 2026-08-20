@@ -2,7 +2,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 numpy==1.24.3
 pandas==1.5.3
-pandas-ta==0.3.14b0
+git+https://github.com/twopirllc/pandas-ta.git
 requests==2.32.3
 python-binance==1.0.19
 redis==5.0.8
