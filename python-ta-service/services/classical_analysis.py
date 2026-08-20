@@ -339,7 +339,18 @@ def detect_candlestick_patterns(df: pd.DataFrame) -> list:
 
 
 def detect_chart_patterns(df: pd.DataFrame) -> list:
-    """Detect higher-level chart patterns: Double/Triple Top/Bottom."""
+    """
+    Detect higher-level chart patterns: Double/Triple Top/Bottom.
+
+    Returns both `strength` (a fixed 4-5 importance weight, NOT a percentage —
+    kept for backward compatibility) and `confidence` (0-100, from peak/trough
+    symmetry, matching detect_head_and_shoulders()'s scale). Consumers must use
+    `confidence`, never `strength`, wherever a 0-100 percentage is expected —
+    a previous bug in PreTradeFilterService::checkPatternAgreement() fell back
+    to `strength` when `confidence` was absent, making every Double/Triple
+    Top/Bottom register as a ~5% confidence pattern regardless of how clean
+    the pattern actually was.
+    """
     patterns = []
     highs = df["high"].values
     lows = df["low"].values
@@ -356,10 +367,12 @@ def detect_chart_patterns(df: pd.DataFrame) -> list:
         i2, v2 = recent_highs[-2]
         i3, v3 = recent_highs[-1]
         if abs(v1 - v2) / v1 < 0.02 and abs(v2 - v3) / v2 < 0.02 and i2 - i1 > 5 and i3 - i2 > 5:
+            dev = (abs(v1 - v2) / v1 + abs(v2 - v3) / v2) / 2
             patterns.append({
                 "name": "Triple Top",
                 "direction": "bearish",
                 "strength": 5,
+                "confidence": int(max(50, min(90, round(90 - dev * 1000)))),
                 "levels": {"peak1": float(v1), "peak2": float(v2), "peak3": float(v3)},
             })
             triple_top_found = True
@@ -368,10 +381,12 @@ def detect_chart_patterns(df: pd.DataFrame) -> list:
         h1_idx, h1_val = recent_highs[-2]
         h2_idx, h2_val = recent_highs[-1]
         if abs(h1_val - h2_val) / h1_val < 0.02 and h2_idx - h1_idx > 5:
+            dev = abs(h1_val - h2_val) / h1_val
             patterns.append({
                 "name": "Double Top",
                 "direction": "bearish",
                 "strength": 4,
+                "confidence": int(max(50, min(85, round(85 - dev * 1000)))),
                 "levels": {"peak1": float(h1_val), "peak2": float(h2_val)},
             })
 
@@ -387,10 +402,12 @@ def detect_chart_patterns(df: pd.DataFrame) -> list:
         i2, v2 = recent_lows[-2]
         i3, v3 = recent_lows[-1]
         if abs(v1 - v2) / v1 < 0.02 and abs(v2 - v3) / v2 < 0.02 and i2 - i1 > 5 and i3 - i2 > 5:
+            dev = (abs(v1 - v2) / v1 + abs(v2 - v3) / v2) / 2
             patterns.append({
                 "name": "Triple Bottom",
                 "direction": "bullish",
                 "strength": 5,
+                "confidence": int(max(50, min(90, round(90 - dev * 1000)))),
                 "levels": {"trough1": float(v1), "trough2": float(v2), "trough3": float(v3)},
             })
             triple_bottom_found = True
@@ -399,10 +416,12 @@ def detect_chart_patterns(df: pd.DataFrame) -> list:
         l1_idx, l1_val = recent_lows[-2]
         l2_idx, l2_val = recent_lows[-1]
         if abs(l1_val - l2_val) / l1_val < 0.02 and l2_idx - l1_idx > 5:
+            dev = abs(l1_val - l2_val) / l1_val
             patterns.append({
                 "name": "Double Bottom",
                 "direction": "bullish",
                 "strength": 4,
+                "confidence": int(max(50, min(85, round(85 - dev * 1000)))),
                 "levels": {"trough1": float(l1_val), "trough2": float(l2_val)},
             })
 
@@ -470,6 +489,92 @@ def detect_head_and_shoulders(df: pd.DataFrame) -> list:
                     "target": round(neckline + (neckline - h_val), 8),
                 }
             })
+
+    return patterns
+
+
+PATTERN_BREAKOUT_VOLUME_RATIO = 2.5  # same threshold as market_regime.py's expansion volume-spike gate
+
+
+def _annotate_pattern_status(df: pd.DataFrame, patterns: list) -> list:
+    """
+    Tag each detected chart pattern with a `status` reflecting whether it is
+    still forming, confirmed (trigger level broken + volume spike), broken
+    without volume confirmation ("pending confirmation"), or already
+    invalidated by current price action.
+
+    Pattern confidence alone is pure historical shape-matching (symmetry of
+    already-passed swing points) — it says nothing about whether the pattern
+    is still tradeable right now. A strong Head & Shoulders whose neckline
+    was broken weeks ago, or whose head has since been re-broken against the
+    pattern's own thesis, is not the same signal as one that just formed and
+    hasn't triggered yet. This also doubles as the "breakout confirmation
+    gate" for Triangle/Wedge patterns (the closest analog in this codebase to
+    a Bollinger-squeeze-style compression pattern) — a trigger-level break
+    with no volume spike is reported as "pending confirmation", not a
+    confirmed breakout, mirroring market_regime.py's EXPANSION gate.
+    """
+    if not patterns or df is None or len(df) == 0:
+        return patterns
+
+    close = float(df["close"].iloc[-1])
+    lookback_vol = min(20, len(df))
+    avg_vol = float(df["volume"].iloc[-lookback_vol:].mean())
+    recent_vol = float(df["volume"].iloc[-1])
+    volume_spike = (recent_vol / avg_vol) >= PATTERN_BREAKOUT_VOLUME_RATIO if avg_vol > 0 else False
+
+    for p in patterns:
+        levels = p.get("levels") or {}
+        name = p.get("name", "")
+
+        if name in ("Head and Shoulders", "Inverse Head and Shoulders"):
+            neckline = levels.get("neckline")
+            head = levels.get("head")
+            if neckline is None or head is None:
+                p["status"] = "forming"
+                continue
+            if name == "Head and Shoulders":  # bearish
+                if close < neckline:
+                    p["status"] = "confirmed_breakdown" if volume_spike else "breakdown_pending_confirmation"
+                elif close > head:
+                    p["status"] = "invalidated"
+                else:
+                    p["status"] = "forming"
+            else:  # Inverse H&S — bullish
+                if close > neckline:
+                    p["status"] = "confirmed_breakout" if volume_spike else "breakout_pending_confirmation"
+                elif close < head:
+                    p["status"] = "invalidated"
+                else:
+                    p["status"] = "forming"
+
+        elif name in ("Double Top", "Triple Top"):
+            peaks = [v for k, v in levels.items() if k.startswith("peak")]
+            p["status"] = "invalidated" if peaks and close > max(peaks) else "forming"
+
+        elif name in ("Double Bottom", "Triple Bottom"):
+            troughs = [v for k, v in levels.items() if k.startswith("trough")]
+            p["status"] = "invalidated" if troughs and close < min(troughs) else "forming"
+
+        elif name in ("Ascending Triangle", "Descending Triangle", "Symmetrical Triangle",
+                      "Falling Wedge", "Rising Wedge"):
+            resistance = levels.get("resistance_now")
+            support = levels.get("support_now")
+            direction = p.get("direction")
+            if resistance is None or support is None:
+                p["status"] = "forming"
+                continue
+            broke_up = close > resistance
+            broke_down = close < support
+            expected_up = direction == "bullish"
+            if (expected_up and broke_up) or (not expected_up and broke_down):
+                p["status"] = "confirmed_breakout" if volume_spike else "breakout_pending_confirmation"
+            elif (expected_up and broke_down) or (not expected_up and broke_up):
+                p["status"] = "invalidated"
+            else:
+                p["status"] = "forming"
+        else:
+            p["status"] = p.get("status", "unknown")
 
     return patterns
 
@@ -617,7 +722,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> dict:
     return {"current": last_atr}
 
 
-def run_classical_analysis(df: pd.DataFrame) -> dict:
+def run_classical_analysis(df: pd.DataFrame, include_patterns: bool = True, include_candles: bool = True) -> dict:
     """Run all classical technical analysis."""
     sr = find_support_resistance(df)
     mas = calculate_moving_averages(df)
@@ -625,12 +730,20 @@ def run_classical_analysis(df: pd.DataFrame) -> dict:
     macd = calculate_macd(df)
     bb = calculate_bollinger_bands(df)
     atr = calculate_atr(df)
-    candle_patterns = detect_candlestick_patterns(df)
-    chart_patterns = (
-        detect_chart_patterns(df)
-        + detect_head_and_shoulders(df)
-        + detect_triangles_and_wedges(df)
-    )
+    
+    if include_candles:
+        candle_patterns = detect_candlestick_patterns(df)
+    else:
+        candle_patterns = []
+    
+    if include_patterns:
+        chart_patterns = _annotate_pattern_status(df, (
+            detect_chart_patterns(df)
+            + detect_head_and_shoulders(df)
+            + detect_triangles_and_wedges(df)
+        ))
+    else:
+        chart_patterns = []
 
     # ── Continuous Bias Scoring (0 to 100) ───────────────────────────────────
     # Weights for each indicator

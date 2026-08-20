@@ -40,7 +40,7 @@ def _collect_points(symbols: list, interval: str, limit: int, warmup: int, max_l
             except Exception:
                 continue
 
-            bias, confidence = compute_overall_bias(classical, smc, harmonic, volume)
+            bias, confidence, _ = compute_overall_bias(classical, smc, harmonic, volume)
             if bias not in ("bullish", "bearish"):
                 continue
 

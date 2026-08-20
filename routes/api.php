@@ -11,8 +11,10 @@ use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\NewsController;
 use App\Http\Controllers\Api\WhaleController;
 use App\Http\Controllers\Api\OpportunityController;
+use App\Http\Controllers\Api\ReportController;
 use App\Http\Controllers\Api\SettingsController;
 use App\Http\Controllers\Api\AgentBridgeController;
+use App\Http\Controllers\Api\BacktestController;
 
 // Auth routes
 Route::prefix('auth')->group(function () {
@@ -35,6 +37,7 @@ Route::get('coins/{symbol}/price', [CoinController::class, 'price']);
 Route::get('/news', [NewsController::class, 'index']);
 Route::get('/news/{id}/read', [NewsController::class, 'read']);
 Route::get('/whales', [WhaleController::class, 'index']);
+Route::get('backtest/{symbol}/chart', [BacktestController::class, 'chart']);
 
 // Protected routes
 Route::middleware('auth:sanctum')->group(function () {
@@ -54,17 +57,35 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('recommendations/{symbol}/latest', [RecommendationController::class, 'latest']);
     Route::get('opportunities', [OpportunityController::class, 'index']);
     Route::post('opportunities/scan', [OpportunityController::class, 'scan']);
+    Route::post('opportunities/train-model', [OpportunityController::class, 'trainModel']);
+    Route::post('opportunities/train-historical', [OpportunityController::class, 'trainHistorical']);
+    Route::get('opportunities/train-historical/status', [OpportunityController::class, 'trainHistoricalStatus']);
+    Route::post('opportunities/{id}/predict', [OpportunityController::class, 'predict']);
     Route::get('opportunities/stats', [OpportunityController::class, 'stats']);
     Route::get('opportunities/scan/status', [OpportunityController::class, 'scanStatus']);
+    Route::get('opportunities/market-health', [OpportunityController::class, 'marketHealth']);
+
+    // Reports
+    Route::get('reports/opportunities', [ReportController::class, 'opportunitiesHistory']);
+    Route::get('reports/paper-trading', [ReportController::class, 'trackedTradesHistory']);
+    Route::get('reports/daily-scan-counts', [ReportController::class, 'dailyScanCounts']);
+
 
     // Paper Trading
+    Route::get('paper-trading/traded-coins', [PaperTradingController::class, 'getTradedCoins']);
     Route::get('paper-trading/sessions', [PaperTradingController::class, 'sessions']);
     Route::post('paper-trading/sessions', [PaperTradingController::class, 'createSession']);
     Route::get('paper-trading/sessions/{id}', [PaperTradingController::class, 'session']);
     Route::post('paper-trading/trades', [PaperTradingController::class, 'openTrade']);
     Route::put('paper-trading/trades/{id}/close', [PaperTradingController::class, 'closeTrade']);
     Route::put('paper-trading/trades/{id}/target', [PaperTradingController::class, 'updateTarget']);
+    Route::put('paper-trading/trades/{id}/settings', [PaperTradingController::class, 'updateTradeSettings']);
     Route::get('paper-trading/trades', [PaperTradingController::class, 'trades']);
+    Route::delete('paper-trading/trades/{id}', [PaperTradingController::class, 'destroy']);
+    Route::post('paper-trading/trades/{id}/reanalyze', [PaperTradingController::class, 'reanalyze']);
+    Route::post('paper-trading/trades/{id}/simulate', [PaperTradingController::class, 'postCloseAnalysis']);
+    Route::get('paper-trading/trades/{id}/check-after-sl', [PaperTradingController::class, 'checkAfterSlTargets']);
+
 
     // Chat
     Route::get('chat', [ChatController::class, 'conversations']);

@@ -19,6 +19,8 @@ class MarketScanProgress implements ShouldBroadcastNow
     public ?int $analysis_id; // the DB id of the analysis
     public ?string $error_reason; // full error string if failed
     public ?string $strategy; // the strategy used to find the coin
+    public ?array $coins_list; // full list of coins being scanned (sent once on start)
+    public ?int $raw_binance_count; // total USDT tickers fetched from Binance before strategy filters
 
     public function __construct(
         string $message,
@@ -27,7 +29,9 @@ class MarketScanProgress implements ShouldBroadcastNow
         ?string $action = null,
         ?int $analysisId = null,
         ?string $errorReason = null,
-        ?string $strategy = null
+        ?string $strategy = null,
+        ?array $coinsList = null,
+        ?int $rawBinanceCount = null
     ) {
         $this->message = $message;
         $this->type = $type;
@@ -36,6 +40,8 @@ class MarketScanProgress implements ShouldBroadcastNow
         $this->analysis_id = $analysisId;
         $this->error_reason = $errorReason;
         $this->strategy = $strategy;
+        $this->coins_list = $coinsList;
+        $this->raw_binance_count = $rawBinanceCount;
     }
 
     public function broadcastOn(): array

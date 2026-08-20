@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Contracts\Encryption\DecryptException;
+use App\Support\VolatilityRegime;
 use Exception;
 
 class OpenRouterService {
@@ -379,7 +380,7 @@ class OpenRouterService {
         $maxTpPct    = round($constraints['max_tp3'] * 100, 1);
         $slPct       = round($constraints['sl_ratio'] * 100, 1);
         $minConf     = (int) ($settings['min_confluences'] ?? 3);
-        $minRR       = (float) ($settings['min_risk_reward'] ?? 1.5);
+        $minRR       = (float) ($settings['min_risk_reward'] ?? 2.0);
 
         $rsi      = round($classical['rsi']['current'] ?? 50, 1);
         $rsiCond  = $classical['rsi']['condition'] ?? 'neutral';
@@ -524,15 +525,24 @@ class OpenRouterService {
                       . "  Treat this as an additional confirmation signal only — do not treat it as a core requirement.\n";
         }
 
-        // ATR SL guidance line
+        // ATR SL guidance line — regime-aware, so the multiplier quoted here always
+        // matches what AnalysisController::validateAndClampRecommendation() and
+        // PreTradeFilterService::checkSlAtrGate() actually enforce (both read the
+        // same VolatilityRegime helper). A flat "1.5x" here would mislabel the
+        // real minimum on medium/high/very_high volatility coins.
         $atrRaw   = $data['classical']['atr']['current'] ?? null;
         $atrBlock = '';
         $sl15x    = 'N/A'; // fallback if ATR unavailable
+        $slMult   = 1.5;
+        $volRegime = 'medium';
         if ($atrRaw && ($data['current_price'] ?? 0) > 0) {
-            $atrPct   = round(($atrRaw / $data['current_price']) * 100, 3);
-            $sl15x    = round($atrRaw * 1.5, 8);
-            $sl2x     = round($atrRaw * 2.0, 8);
-            $atrBlock = "\nATR SL Guide: ATR={$atr} ({$atrPct}% of price). Recommended SL = Entry ± 1.5×ATR (\${$sl15x}). Volatility SL = Entry ± 2×ATR (\${$sl2x}).\n";
+            $atrPct    = round(($atrRaw / $data['current_price']) * 100, 3);
+            $volRegime = VolatilityRegime::classify($atrPct, $timeframe);
+            $slMult    = VolatilityRegime::multipliers($volRegime, $timeframe)['sl'];
+            $sl15x     = round($atrRaw * $slMult, 8);
+            $sl2x      = round($atrRaw * 2.0, 8);
+            $regimeDesc = VolatilityRegime::describe($volRegime, $atrPct, $timeframe);
+            $atrBlock  = "\nATR SL Guide: ATR={$atr} — Volatility Regime: {$regimeDesc}. Recommended SL = Entry ± {$slMult}×ATR (\${$sl15x}). Volatility SL = Entry ± 2×ATR (\${$sl2x}).\n";
         }
 
         return <<<PROMPT
@@ -553,7 +563,7 @@ RULES:
 - Price inside a BEARISH OB zone is a caution flag, not an automatic veto — a real-data backtest (747 bullish signals) found no significant win-rate difference vs. being outside one (94.7% vs 96.7%). Weigh it with other confluences instead of auto-rejecting the BUY. If price is directly below a BLOCKING Bearish FVG, you MUST still output WAIT or SELL — never BUY (not separately tested, still a hard rule).
 - ⚠️ VOLUME & FAKE PUMP CHECK: If you detect a sudden pump/dump but volume is poor or Volume Profile status indicates weakness/fake pump, you MUST reject the trade and output WAIT to avoid liquidity sweeps.
 - Place SL behind nearest invalidation structure (OB/Swing High/Low) + ATR buffer. Max SL: {$slPct}%.
-- ⚠️ CRITICAL SL RULE: The SL distance from entry MUST be >= 1.5× ATR. Current ATR = {$atr}. Minimum SL distance = {$sl15x}. NEVER suggest an SL closer than this — a tighter SL will be hit by normal market noise before the trade plays out, regardless of the signal quality.
+- ⚠️ CRITICAL SL RULE: The SL distance from entry MUST be >= {$slMult}× ATR ({$volRegime} volatility regime). Current ATR = {$atr}. Minimum SL distance = {$sl15x}. NEVER suggest an SL closer than this — a tighter SL will be hit by normal market noise before the trade plays out, regardless of the signal quality.
 - ⚠️ PRICE DISCOVERY SL RULE: If the coin is in Price Discovery (breaking all-time highs with no resistance above) and 1h support is too far or weak, DO NOT rely purely on fragile 1h FVGs for Stop Loss. Use a wider ATR multiplier (e.g., 2x ATR) to avoid getting stopped out by fakeout wicks.
 - TP1/TP2/TP3 aligned with FVG, POC/VAH/VAL, or S/R levels. Max TP3 distance: {$maxTpPct}%.
 - Your "confidence" must be grounded in the pre-computed technical confidence above.
@@ -577,7 +587,7 @@ PROMPT;
     ): string {
         $price    = $ltfData['current_price'] ?? 0;
         $minConf  = (int)   ($settings['min_confluences'] ?? 3);
-        $minRR    = (float) ($settings['min_risk_reward'] ?? 1.5);
+        $minRR    = (float) ($settings['min_risk_reward'] ?? 2.0);
         $constraints = $this->getTimeframeConstraints($ltfTf);
         $maxTpPct    = round($constraints['max_tp3'] * 100, 1);
         $slPct       = round($constraints['sl_ratio'] * 100, 1);
@@ -636,9 +646,23 @@ PROMPT;
         $mtfBias = strtoupper($mtfData['overall_bias'] ?? 'NEUTRAL');
         $ltfBias = strtoupper($ltfData['overall_bias'] ?? 'NEUTRAL');
 
-        $biasAlignment = ($htfBias === $mtfBias && $mtfBias === $ltfBias)
-            ? "✅ ALL 3 TIMEFRAMES ALIGNED: {$htfBias}"
-            : "⚠️ MIXED BIAS: HTF={$htfBias} MTF={$mtfBias} LTF={$ltfBias}";
+        $htfConf = (int) ($htfData['overall_confidence'] ?? 0);
+        $mtfConf = (int) ($mtfData['overall_confidence'] ?? 0);
+        $ltfConf = (int) ($ltfData['overall_confidence'] ?? 0);
+        $minTfConf = min($htfConf, $mtfConf, $ltfConf);
+
+        // Direction and strength are reported separately — "aligned" only tells
+        // you the three schools agree on sign, not that the signal is strong.
+        // A 55%/28%/25% "all bullish" reading is direction-aligned but weak, and
+        // must not be presented as unqualified "Full Alignment".
+        $directionAligned = ($htfBias === $mtfBias && $mtfBias === $ltfBias);
+        $mtfDirection = $directionAligned
+            ? "✅ ALIGNED: {$htfBias}"
+            : "⚠️ MIXED: HTF={$htfBias} MTF={$mtfBias} LTF={$ltfBias}";
+        $mtfStrength = $minTfConf >= 60 ? "🟢 STRONG (min {$minTfConf}%)"
+            : ($minTfConf >= 40 ? "🟡 MODERATE (min {$minTfConf}%)" : "🔴 WEAK (min {$minTfConf}%)");
+        $biasAlignment = "MTF Direction: {$mtfDirection} | MTF Strength: {$mtfStrength}\n"
+            . "HTF={$htfBias}({$htfConf}%) MTF={$mtfBias}({$mtfConf}%) LTF={$ltfBias}({$ltfConf}%)";
 
         $newsData = $ltfData['specific_news'] ?? [];
         $newsBlock = '';
@@ -658,12 +682,13 @@ TOP-DOWN DATA:
 {$mtfLine}
 {$ltfLine}
 {$newsBlock}
-RULES:
-- Use HTF [{$htfTf}] for bias direction only.
-- Use MTF [{$mtfTf}] to identify OB/FVG confluence zones.
-- Use LTF [{$ltfTf}] for precise entry (CHoCH confirmation).
-- BUY/SELL only if ALL 3 timeframes share the same bias direction AND >= {$minConf} confluences across timeframes.
-- If biases conflict, output WAIT.
+RULES — PURE SCALPING TIMEFRAME ROLES (5m owns the entry decision; 1h/15m are CONTEXT ONLY, never automatic blockers):
+- HTF [{$htfTf}] = macro context only. Tells you whether a setup is WITH the bigger trend or COUNTER-TREND — informational, never a hard veto.
+- MTF [{$mtfTf}] = intermediate context only. Same role as HTF, one step closer. Also never a hard veto by itself.
+- LTF [{$ltfTf}] = EXECUTION TIMEFRAME. This is the ONLY timeframe allowed to generate the actual entry trigger — an aligned CHoCH/BOS or a genuine liquidity sweep. A trade may proceed even when HTF/MTF are neutral or only weakly aligned, PROVIDED LTF has a real, confirmed setup. Do NOT treat "1h + 15m + 5m all say the same word" as high-quality confirmation by itself — report MTF Direction and MTF Strength SEPARATELY (e.g. "Direction: BULLISH, Strength: WEAK" when confidences are low even though all three agree).
+- HARD BLOCK (this one IS real, and it's about LTF's OWN structure, not MTF/HTF): do not BUY if LTF structure is bearish AND there is a confirmed bearish BOS/CHoCH AND price sits below important nearby structure. Mirror for SELL. Higher-timeframe disagreement alone is NEVER enough to block a scalp.
+- Plain indicator agreement (EMA/RSI/MACD) on LTF is NOT a sufficient trigger by itself — if there's no CHoCH/BOS or liquidity sweep on LTF, output WAIT rather than inflating confidence to compensate for a missing trigger. A deterministic gate re-scores this from scratch after you respond (Execution 40% + Setup Quality 30% + Direction 20% + Risk 10%) and will override your action if the execution trigger isn't actually there.
+- A directional lean is NOT the same as an executable trade — only output BUY/SELL when there is a real LTF entry trigger; otherwise WAIT, and state clearly what specific event (e.g. "close above $X with a bullish CHoCH") would activate the trade.
 - entry_price within 0.5% of {$price}.
 - If market is 'squeezed' or 'ranging' (strong resistance above and support below), DO NOT default to WAIT. Look for high-probability SCALPING / COUNTER-TREND trades (e.g. shorting resistance, buying support) if the Risk/Reward is at least {$minRR}.
 - Price inside a Bearish OB is a caution flag, not an automatic veto — a real-data backtest found no significant win-rate difference vs. being outside one; weigh it alongside other confluences instead of auto-rejecting the BUY. NEVER issue a BUY if price is directly underneath a BLOCKING Bearish FVG (not separately tested, still a hard rule).
@@ -689,7 +714,7 @@ PROMPT;
         $constraints  = $this->getTimeframeConstraints($timeframe);
         $settings     = $this->loadSettings();
         $minConf      = (int) ($settings['min_confluences'] ?? 3);
-        $minRR        = (float) ($settings['min_risk_reward'] ?? 1.5);
+        $minRR        = (float) ($settings['min_risk_reward'] ?? 2.0);
 
         $supports    = collect($data['classical']['support_resistance']['support']    ?? [])->pluck('price')->map(fn($p) => (float)$p)->sort()->values()->toArray();
         $resistances = collect($data['classical']['support_resistance']['resistance'] ?? [])->pluck('price')->map(fn($p) => (float)$p)->sort()->values()->toArray();

@@ -25,3 +25,27 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# ML model files (auto-generated on server)
+python-ta-service/trade_model.pkl
+python-ta-service/trade_scaler.pkl
+
+# Python virtual environment
+python-ta-service/venv/
+python-ta-service/__pycache__/
+python-ta-service/services/__pycache__/
+
+# Scratch / temp files
+scratch/
+temp_data.json
+temp_raw_data.json
+test.json
+test_pretty.json
+fix.py
+fix_balances.php
+scratch.py
+test_sl.php
+test_sl2.php
+
+# Docker (optional — keep if you want)
+# docker-compose.yml

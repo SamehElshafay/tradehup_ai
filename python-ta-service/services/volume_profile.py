@@ -152,3 +152,99 @@ def run_volume_profile_analysis(df: pd.DataFrame) -> dict:
             "val": vp.get("val")
         }
     }
+
+
+def get_volume_decision_context(volume_data: dict, overall_bias: str, current_price: float) -> dict:
+    """
+    Translate Volume Profile levels into a decision context for PreTradeFilterService.
+
+    Logic:
+      - Price above VAH + bullish bias  → confirmation bonus (+5%)
+      - Price below VAL + bearish bias  → confirmation bonus (+5%)
+      - Price above VAH + bearish bias  → contradiction warning (strong resistance area)
+      - Price below VAL + bullish bias  → contradiction warning (potential value trap)
+      - Price within ±0.3% of POC      → decision point warning (high-volume equilibrium)
+      - Price inside Value Area         → neutral context (no bonus, no penalty)
+    """
+    key_levels = volume_data.get("key_levels", {})
+    poc = key_levels.get("poc")
+    vah = key_levels.get("vah")
+    val = key_levels.get("val")
+
+    if not poc or not vah or not val or not current_price:
+        return {
+            "status" : "no_data",
+            "bonus"  : 0,
+            "warning": None,
+            "context": "Volume Profile data unavailable — no adjustment applied",
+        }
+
+    bias = (overall_bias or "neutral").lower()
+
+    # ── Price outside Value Area ──────────────────────────────────────────────
+    if current_price > vah:
+        if bias == "bullish":
+            return {
+                "status" : "bullish_above_vah",
+                "bonus"  : 5,
+                "warning": None,
+                "context": f"Price above VAH ({vah:.6g}) — bullish momentum confirmed by Volume Profile",
+            }
+        else:
+            return {
+                "status" : "bearish_above_vah",
+                "bonus"  : 0,
+                "warning": (
+                    f"⚠️ Volume Profile: Price above VAH ({vah:.6g}) yet bias is bearish — "
+                    "price is in a thin-volume zone above the value area; short setups require extra confirmation"
+                ),
+                "context": "contradiction_above_vah",
+            }
+
+    if current_price < val:
+        if bias == "bearish":
+            return {
+                "status" : "bearish_below_val",
+                "bonus"  : 5,
+                "warning": None,
+                "context": f"Price below VAL ({val:.6g}) — bearish momentum confirmed by Volume Profile",
+            }
+        else:
+            return {
+                "status" : "bullish_below_val",
+                "bonus"  : 0,
+                "warning": (
+                    f"⚠️ Volume Profile: Price below VAL ({val:.6g}) yet bias is bullish — "
+                    "could be a value trap; bullish setups require extra confirmation before entry"
+                ),
+                "context": "contradiction_below_val",
+            }
+
+    # ── Price at POC (±0.3%) ──────────────────────────────────────────────────
+    poc_proximity = abs(current_price - poc) / poc if poc else 1
+    if poc_proximity <= 0.003:
+        return {
+            "status" : "at_poc",
+            "bonus"  : 0,
+            "warning": (
+                f"⚠️ Volume Profile: Price at POC ({poc:.6g}) — high-volume equilibrium zone. "
+                "Price can go either way from here; wait for a decisive close above/below POC before entry"
+            ),
+            "context": f"price_at_poc ({current_price:.6g} ≈ {poc:.6g})",
+        }
+
+    # ── Price inside Value Area ───────────────────────────────────────────────
+    if current_price > poc:
+        return {
+            "status" : "inside_va_bullish_half",
+            "bonus"  : 0,
+            "warning": None,
+            "context": f"Price between POC ({poc:.6g}) and VAH ({vah:.6g}) — inside value area (bullish half)",
+        }
+    else:
+        return {
+            "status" : "inside_va_bearish_half",
+            "bonus"  : 0,
+            "warning": None,
+            "context": f"Price between VAL ({val:.6g}) and POC ({poc:.6g}) — inside value area (bearish half)",
+        }

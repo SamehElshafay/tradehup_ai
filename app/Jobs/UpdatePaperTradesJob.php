@@ -42,7 +42,18 @@ class UpdatePaperTradesJob implements ShouldQueue {
         $klines = $response->json();
         if (empty($klines)) return;
 
+        $tradeCreatedMs = $trade->created_at->timestamp * 1000;
+
         foreach ($klines as $kline) {
+            $candleOpenMs = (int) $kline[0];
+            
+            // Skip candles that opened before or during the exact minute the trade was created.
+            // This prevents false-positive SL hits from price action that occurred earlier in the same minute.
+            if ($candleOpenMs <= $tradeCreatedMs) {
+                continue;
+            }
+
+            $candleTimeStr = \Carbon\Carbon::createFromTimestampMs($candleOpenMs)->toIso8601String();
             $high = (float) $kline[2];
             $low = (float) $kline[3];
             $close = (float) $kline[4];
@@ -50,13 +61,13 @@ class UpdatePaperTradesJob implements ShouldQueue {
             // Check SL first in the candle
             $hitSl = $trade->type === 'BUY' ? ($low <= $trade->sl) : ($high >= $trade->sl);
             if ($hitSl) {
-                $this->checkAndCloseTrade($trade, $trade->sl, true);
+                $this->checkAndCloseTrade($trade, $trade->sl, $candleTimeStr, true);
                 return;
             }
             
             // Check TP progression based on High (for BUY) or Low (for SELL)
             $bestPrice = $trade->type === 'BUY' ? $high : $low;
-            $this->checkAndCloseTrade($trade, $bestPrice, false);
+            $this->checkAndCloseTrade($trade, $bestPrice, $candleTimeStr, false);
             
             // If trade is closed, stop evaluating
             if ($trade->status !== 'open') return;
@@ -66,7 +77,7 @@ class UpdatePaperTradesJob implements ShouldQueue {
         $trade->touch();
     }
 
-    private function checkAndCloseTrade(PaperTrade $trade, float $price, bool $forceSl = false): void {
+    private function checkAndCloseTrade(PaperTrade $trade, float $price, string $eventTime, bool $forceSl = false): void {
         $session = $trade->session;
         $isBuy = $trade->type === 'BUY';
         
@@ -75,32 +86,44 @@ class UpdatePaperTradesJob implements ShouldQueue {
         $hitTp3 = $isBuy ? ($trade->tp3 && $price >= $trade->tp3) : ($trade->tp3 && $price <= $trade->tp3);
         $hitSl  = $forceSl || ($isBuy ? ($price <= $trade->sl) : ($price >= $trade->sl));
 
+        $hitCustomTp = false;
+        $customTpPrice = null;
+        if (!is_null($trade->custom_tp_percent)) {
+            $customTpPrice = $trade->entry_price * (1 + ($trade->custom_tp_percent / 100) * ($isBuy ? 1 : -1));
+            $hitCustomTp = $isBuy ? ($price >= $customTpPrice) : ($price <= $customTpPrice);
+        }
+
         $history = is_array($trade->history) ? $trade->history : [];
         $highestHit = $trade->highest_target_hit;
         $shouldClose = null;
 
         // Check timeline events incrementally
         if ($hitTp1 && !in_array($highestHit, ['tp1', 'tp2', 'tp3'])) {
-            $history[] = ['event' => 'tp1', 'price' => $trade->tp1, 'timestamp' => now()->toIso8601String()];
+            $history[] = ['event' => 'tp1', 'price' => $trade->tp1, 'timestamp' => $eventTime];
             $highestHit = 'tp1';
             event(new TradeTargetHit($trade->coin->symbol, $trade->type, 'tp1', $this->calcPnlPct($trade, $trade->tp1), $trade->recommendation?->strategy));
         }
         if ($hitTp2 && !in_array($highestHit, ['tp2', 'tp3'])) {
-            $history[] = ['event' => 'tp2', 'price' => $trade->tp2, 'timestamp' => now()->toIso8601String()];
+            $history[] = ['event' => 'tp2', 'price' => $trade->tp2, 'timestamp' => $eventTime];
             $highestHit = 'tp2';
             event(new TradeTargetHit($trade->coin->symbol, $trade->type, 'tp2', $this->calcPnlPct($trade, $trade->tp2), $trade->recommendation?->strategy));
         }
         if ($hitTp3 && $highestHit !== 'tp3') {
-            $history[] = ['event' => 'tp3', 'price' => $trade->tp3, 'timestamp' => now()->toIso8601String()];
+            $history[] = ['event' => 'tp3', 'price' => $trade->tp3, 'timestamp' => $eventTime];
             $highestHit = 'tp3';
             event(new TradeTargetHit($trade->coin->symbol, $trade->type, 'tp3', $this->calcPnlPct($trade, $trade->tp3), $trade->recommendation?->strategy));
         }
 
         if ($hitSl) {
-            $history[] = ['event' => 'sl', 'price' => $trade->sl, 'timestamp' => now()->toIso8601String()];
+            $history[] = ['event' => 'sl', 'price' => $trade->sl, 'timestamp' => $eventTime];
             $shouldClose = 'closed_sl';
             $closePrice = $trade->sl;
             event(new TradeTargetHit($trade->coin->symbol, $trade->type, 'sl', $this->calcPnlPct($trade, $trade->sl), $trade->recommendation?->strategy));
+        } elseif ($hitCustomTp) {
+            $history[] = ['event' => 'custom_tp', 'price' => $customTpPrice, 'timestamp' => $eventTime];
+            $shouldClose = 'closed_custom_tp';
+            $closePrice = $customTpPrice;
+            event(new TradeTargetHit($trade->coin->symbol, $trade->type, 'custom_tp', $trade->custom_tp_percent, $trade->recommendation?->strategy));
         } elseif (($trade->close_target === 'tp1' && $hitTp1) || 
                   ($trade->close_target === 'tp2' && $hitTp2) || 
                   ($trade->close_target === 'tp3' && $hitTp3)) {
@@ -116,7 +139,7 @@ class UpdatePaperTradesJob implements ShouldQueue {
                 'pnl' => $pnl, 
                 'pnl_percent' => $pnlPercent, 
                 'status' => $shouldClose, 
-                'closed_at' => now(),
+                'closed_at' => $eventTime,
                 'history' => $history,
                 'highest_target_hit' => $highestHit
             ]);

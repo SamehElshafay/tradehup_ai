@@ -111,7 +111,7 @@ def validate_filter(
             except Exception:
                 continue
 
-            bias, confidence = compute_overall_bias(classical, smc, harmonic, volume)
+            bias, confidence, _ = compute_overall_bias(classical, smc, harmonic, volume)
             if bias not in ("bullish", "bearish"):
                 continue
 

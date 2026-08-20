@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 import traceback
 import pandas as pd
@@ -9,13 +9,20 @@ from services.binance_fetcher import fetch_ohlcv, fetch_ticker_price, fetch_top_
 from services.classical_analysis import run_classical_analysis
 from services.smc_analysis import run_smc_analysis
 from services.harmonic_analysis import run_harmonic_analysis
-from services.volume_profile import run_volume_profile_analysis
+from services.volume_profile import run_volume_profile_analysis, get_volume_decision_context
 from services.bias_combiner import compute_overall_bias
-from services.backtest import run_backtest, run_realistic_backtest
+from services.liquidity_sweep import detect_liquidity_sweeps
+from services.market_regime import detect_market_regime
+from services.backtest import run_backtest, run_realistic_backtest, run_chart_backtest
 from services.weight_search import search_weights
 from services.trade_optimizer import optimize_trade_params
 from services.filter_validator import validate_filter
 from services.ob_rule_validator import validate_ob_rule
+from services.ml_service import ml_service
+from services.historical_trainer import generate_historical_dataset
+from services.order_book_analysis import fetch_order_book, analyze_order_book
+from services.cvd_analysis import calculate_cvd
+from services.taker_pressure_analysis import analyze_taker_pressure
 
 # Clear any stale cache on startup
 _cache.clear()
@@ -36,16 +43,80 @@ app.add_middleware(
 
 
 class AnalysisRequest(BaseModel):
-    symbol: str
-    exchange: str = "binance"
-    interval: str = "4h"
-    limit: int = 500
+    symbol: str = Field(..., description="Trading pair symbol (e.g., BTCUSDT)")
+    exchange: str = Field("binance", description="Exchange name")
+    interval: str = Field("4h", description="Timeframe (e.g., 15m, 1h, 4h, 1d)")
+    limit: int = Field(500, description="Number of historical candles to fetch")
+    include_harmonic: bool = Field(True, description="Whether to include harmonic pattern detection")
+    include_classical: bool = Field(True, description="Whether to include classical chart pattern detection")
+    include_candles: bool = Field(True, description="Whether to include candlestick pattern detection")
+    include_order_book: bool = Field(False, description="Fetch live order book for spread/depth/imbalance analysis")
+    include_cvd: bool = Field(False, description="Compute CVD (Cumulative Volume Delta) from OHLCV taker data")
+    include_taker_pressure: bool = Field(False, description="Analyse taker buy/sell pressure as OI alternative for Spot")
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "ta-engine", "version": "1.0.0"}
+    return {"status": "ok", "service": "ta_engine"}
 
+from typing import List, Dict, Any
+
+@app.post("/ml/train")
+def train_model(dataset: List[Dict[str, Any]]):
+    try:
+        result = ml_service.train(dataset)
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/ml/predict")
+def predict_model(opportunity: Dict[str, Any]):
+    try:
+        result = ml_service.predict(opportunity)
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class HistoricalTrainRequest(BaseModel):
+    coins: Optional[List[str]] = None
+    timeframes: Optional[List[str]] = None
+    limit: int = 1000
+
+
+@app.post("/ml/train-historical")
+def train_on_historical(req: HistoricalTrainRequest):
+    """
+    Fetch real OHLCV data from Binance for the specified coins/timeframes,
+    generate thousands of labeled synthetic trade samples, then train the ML model.
+    """
+    try:
+        dataset = generate_historical_dataset(
+            coins=req.coins,
+            timeframes=req.timeframes,
+            limit=req.limit,
+        )
+        if not dataset:
+            raise HTTPException(status_code=400, detail="No training samples were generated. Check coins/timeframes.")
+
+        result = ml_service.train(dataset)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ml/train-historical/status")
+def train_historical_status():
+    """Returns current model status."""
+    return {
+        "model_loaded": ml_service.model is not None,
+        "status": "ready" if ml_service.model is not None else "not_trained",
+    }
 
 @app.post("/analyze")
 def analyze(req: AnalysisRequest):
@@ -83,16 +154,53 @@ def analyze(req: AnalysisRequest):
         if df is None or len(df) < 50:
             raise HTTPException(status_code=400, detail="Not enough data for analysis")
 
+        # Live price for the "current_price" field — fetch_ohlcv now drops the
+        # still-forming candle (see binance_fetcher.py) so the last row's close
+        # is up to one full candle stale. Entry/SL/TP need the actual live
+        # price, not a several-minutes-old closed-candle close. Falls back to
+        # the last closed close if the ticker call itself fails.
+        try:
+            live_price = fetch_ticker_price(symbol, req.exchange)
+        except Exception:
+            live_price = float(df["close"].iloc[-1])
+
         # Run all analysis in sequence
-        classical = run_classical_analysis(df)
+        classical = run_classical_analysis(
+            df,
+            include_patterns=req.include_classical,
+            include_candles=req.include_candles
+        )
         smc = run_smc_analysis(df)
-        harmonic = run_harmonic_analysis(df)
+        # Harmonic (XA-BC-CD wave pattern detection) is the most compute-heavy school and
+        # user-toggleable in Settings — skip the scan entirely rather than compute-then-discard.
+        harmonic = run_harmonic_analysis(df) if req.include_harmonic else {
+            "patterns": [], "fibonacci": {}, "bias": "neutral", "patterns_count": 0,
+        }
         volume = run_volume_profile_analysis(df)
 
-        # Determine overall bias by weighting all schools (Classical 30%, SMC 10%,
-        # Harmonic 50%, Volume 10% — data-derived, see bias_combiner.py) — shared
-        # with the backtester so both stay in sync.
-        overall_bias, overall_confidence = compute_overall_bias(classical, smc, harmonic, volume)
+        # ── Phase 2: Market Regime + Liquidity Sweep + Volume Context ──────────
+        # Regime is now computed BEFORE bias so the modifier can be applied
+        # inside compute_overall_bias (Phase 3 fix).
+        market_regime      = detect_market_regime(df, classical, smc, req.interval)
+        liquidity_sweeps   = detect_liquidity_sweeps(df, smc)
+        volume_context     = get_volume_decision_context(
+            volume, None, float(df["close"].iloc[-1])
+        )
+
+        # Determine overall bias by weighting all schools.
+        # Phase 3: pass market_regime and patterns so regime modifier + conflict
+        # penalty are applied inside compute_overall_bias instead of being advisory-only.
+        overall_bias, overall_confidence, score_breakdown = compute_overall_bias(
+            classical, smc, harmonic, volume,
+            market_regime     = market_regime,
+            classical_patterns= classical.get("chart_patterns") or [],
+            harmonic_patterns = harmonic.get("patterns") or [],
+        )
+
+        # Re-run volume context now that we have overall_bias
+        volume_context = get_volume_decision_context(
+            volume, overall_bias, float(df["close"].iloc[-1])
+        )
 
         # Collect confluences — each must be directionally validated vs. current price
         confluences = []
@@ -107,8 +215,21 @@ def analyze(req: AnalysisRequest):
         if classical.get("rsi", {}).get("condition") in ["overbought", "oversold"]:
             confluences.append(f"RSI {classical['rsi']['condition']} at {classical['rsi']['current']:.1f}")
         if classical.get("chart_patterns"):
+            PATTERN_STATUS_LABELS = {
+                "forming": "forming — trigger level not yet broken",
+                "confirmed_breakdown": "CONFIRMED breakdown (neckline broken + volume confirmed)",
+                "confirmed_breakout": "CONFIRMED breakout (trigger broken + volume confirmed)",
+                "breakdown_pending_confirmation": "breakdown WITHOUT volume confirmation yet — weak signal",
+                "breakout_pending_confirmation": "breakout WITHOUT volume confirmation yet — weak signal",
+            }
             for p in classical["chart_patterns"]:
-                confluences.append(f"{p['name']} ({p['direction']}) detected")
+                status = p.get("status", "unknown")
+                if status == "invalidated":
+                    # Already broken against its own thesis by current price — not an
+                    # active directional signal, don't present it as a confluence.
+                    continue
+                status_label = PATTERN_STATUS_LABELS.get(status, status)
+                confluences.append(f"{p['name']} ({p['direction']}) — {status_label}")
         if harmonic.get("patterns"):
             for p in harmonic["patterns"]:
                 confluences.append(f"{p['pattern']} pattern ({p['direction']}) detected")
@@ -175,13 +296,13 @@ def analyze(req: AnalysisRequest):
             dist_pct = (fvg_mid - last_close) / last_close * 100  # positive = above price
             if 0 < dist_pct <= 5.0 and fvg["type"] == "bearish":
                 overhead_bearish_fvgs.append(
-                    f"⚠️ BLOCKING BEARISH FVG at {fmt(fvg['bottom'])}–{fmt(fvg['top'])} "
+                    f"[{req.interval}] ⚠️ BLOCKING BEARISH FVG at {fmt(fvg['bottom'])}–{fmt(fvg['top'])} "
                     f"({dist_pct:.2f}% above price) — blocks upward move to POC/resistance"
                 )
             elif abs(dist_pct) <= 5.0:
                 position = "below" if fvg_mid < last_close else "above"
                 nearby_fvgs.append(
-                    f"{fvg['type'].upper()} FVG {fmt(fvg['bottom'])}–{fmt(fvg['top'])} ({position} price, {abs(dist_pct):.1f}%)"
+                    f"[{req.interval}] {fvg['type'].upper()} FVG {fmt(fvg['bottom'])}–{fmt(fvg['top'])} ({position} price, {abs(dist_pct):.1f}%)"
                 )
 
         # Put blocking FVGs first — they are the most critical
@@ -212,14 +333,48 @@ def analyze(req: AnalysisRequest):
         window_mask = df["open_time"] >= (last_time - pd.Timedelta(hours=24))
         volume_24h = float(volume_col[window_mask].sum())
 
+        # Calculate Velocity (speed of price movement over last 5 candles)
+        try:
+            close_series = pd.to_numeric(df["close"])
+            velocity = float((close_series.iloc[-1] - close_series.shift(5).iloc[-1]) / 5)
+        except Exception:
+            velocity = 0.0
+
+        # ── Phase 4: Optional Execution-Quality Engines ────────────────────────
+        # Each engine is gated by its flag — when disabled, returns None so the
+        # backend and report generator can skip it entirely.
+        order_book_result = None
+        if req.include_order_book:
+            try:
+                raw_ob = fetch_order_book(symbol, req.exchange)
+                order_book_result = analyze_order_book(raw_ob, live_price)
+            except Exception:
+                order_book_result = None
+
+        cvd_result = None
+        if req.include_cvd:
+            try:
+                cvd_result = calculate_cvd(df)
+            except Exception:
+                cvd_result = None
+
+        taker_pressure_result = None
+        if req.include_taker_pressure:
+            try:
+                taker_pressure_result = analyze_taker_pressure(df, overall_bias)
+            except Exception:
+                taker_pressure_result = None
+
         return {
             "symbol": symbol,
             "interval": req.interval,
             "analyzed_at": str(df["open_time"].iloc[-1]),
-            "current_price": float(df["close"].iloc[-1]),
+            "current_price": live_price,
             "volume_24h": volume_24h,
+            "velocity": velocity,
             "overall_bias": overall_bias,
             "overall_confidence": overall_confidence,
+            "score_breakdown": score_breakdown,
             "confluences": confluences,
             "chart_overlays": chart_overlays,
             "candles": candles,
@@ -231,8 +386,14 @@ def analyze(req: AnalysisRequest):
                 **smc,
                 "confidence": smc.get("confidence", 0)
             },
-            "harmonic": harmonic,
-            "volume_profile": volume
+            "harmonic"               : harmonic,
+            "volume_profile"         : volume,
+            "liquidity_sweeps"       : liquidity_sweeps,
+            "market_regime"          : market_regime,
+            "volume_decision_context": volume_context,
+            "order_book"             : order_book_result,
+            "cvd_analysis"           : cvd_result,
+            "taker_pressure"         : taker_pressure_result,
         }
 
     except HTTPException:
@@ -362,6 +523,21 @@ def validate_filter_endpoint(symbols: str, interval: str = "15m", limit: int = 5
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Filter validation failed: {str(e)}\n{traceback.format_exc()}")
+
+
+@app.get("/backtest-chart")
+def backtest_chart(symbol: str, exchange: str = "binance", interval: str = "15m", limit: int = 500, step: int = 1, min_confidence: int = 0):
+    """
+    Full walk-forward backtest returning EVERY analyzed point (not a 50-record
+    sample) plus the raw candle series, so a frontend can plot predictions
+    directly on the historical chart against what price actually did.
+    """
+    try:
+        return run_chart_backtest(symbol=symbol.upper(), exchange=exchange, interval=interval, limit=limit, step=step, min_confidence=min_confidence)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chart backtest failed: {str(e)}\n{traceback.format_exc()}")
 
 
 @app.get("/optimize-weights")

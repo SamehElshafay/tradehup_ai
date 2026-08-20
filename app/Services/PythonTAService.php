@@ -11,13 +11,19 @@ class PythonTAService {
         $this->baseUrl = rtrim(config('services.ta_engine.url', env('TA_SERVICE_URL', 'http://localhost:8001')), '/');
     }
 
-    public function analyze(string $symbol, string $exchange = 'binance', string $interval = '4h', int $limit = 500): array {
+    public function analyze(string $symbol, string $exchange = 'binance', string $interval = '4h', int $limit = 500, bool $includeHarmonic = true, bool $includeClassical = true, bool $includeCandles = true, bool $includeOrderBook = false, bool $includeCvd = false, bool $includeTakerPressure = false): array {
         try {
             $response = Http::timeout(60)->post("{$this->baseUrl}/analyze", [
-                'symbol' => $symbol,
-                'exchange' => $exchange,
-                'interval' => $interval,
-                'limit' => $limit
+                'symbol'                => $symbol,
+                'exchange'              => $exchange,
+                'interval'              => $interval,
+                'limit'                 => $limit,
+                'include_harmonic'      => $includeHarmonic,
+                'include_classical'     => $includeClassical,
+                'include_candles'       => $includeCandles,
+                'include_order_book'    => $includeOrderBook,
+                'include_cvd'           => $includeCvd,
+                'include_taker_pressure'=> $includeTakerPressure,
             ]);
 
             if ($response->successful()) {
@@ -64,6 +70,26 @@ class PythonTAService {
         } catch (Exception $e) {
             return null;
         }
+    }
+
+    /**
+     * Walk-forward backtest for the "Backtest Lab" tab: replays historical
+     * candles through the real deterministic analysis engine and returns
+     * every prediction (bias/confidence/TP/SL/outcome) plus the candle series
+     * for the frontend to plot against the actual chart. Can take a while for
+     * large limits (analyzing hundreds of candles), so a generous timeout.
+     */
+    public function runChartBacktest(string $symbol, string $exchange = 'binance', string $interval = '15m', int $limit = 500, int $step = 1, int $minConfidence = 0): array {
+        $response = Http::timeout(600)->get("{$this->baseUrl}/backtest-chart", [
+            'symbol' => $symbol, 'exchange' => $exchange, 'interval' => $interval, 'limit' => $limit, 'step' => $step, 'min_confidence' => $minConfidence,
+        ]);
+
+        if (!$response->successful()) {
+            Log::error('TA Service backtest-chart failed', ['symbol' => $symbol, 'status' => $response->status(), 'body' => $response->body()]);
+            throw new Exception('Backtest failed: ' . ($response->json()['detail'] ?? $response->body()));
+        }
+
+        return $response->json();
     }
 
     public function isHealthy(): bool {

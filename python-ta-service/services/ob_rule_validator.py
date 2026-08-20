@@ -58,7 +58,7 @@ def validate_ob_rule(
             except Exception:
                 continue
 
-            bias, confidence = compute_overall_bias(classical, smc, harmonic, volume)
+            bias, confidence, _ = compute_overall_bias(classical, smc, harmonic, volume)
             if bias != "bullish":
                 continue  # the rule only ever blocks BUY, so only bullish signals are relevant
 

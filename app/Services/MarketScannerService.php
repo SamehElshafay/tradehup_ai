@@ -5,6 +5,13 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class MarketScannerService {
+
+    /** Stores the number of valid USDT tickers fetched from Binance before strategy filters. */
+    private int $lastRawCount = 0;
+
+    public function getLastRawCount(): int {
+        return $this->lastRawCount;
+    }
     
     /**
      * Fetch trending coins from CoinGecko.
@@ -47,7 +54,8 @@ class MarketScannerService {
     }
 
     /**
-     * Fetch all Binance 24h tickers and apply Smart Money strategies.
+     * Fetch Binance tickers (24h or rolling window) and apply Smart Money strategies.
+     * @param string $volumeWindow  '24h' uses /ticker/24hr (standard), '1h'/'4h'/etc. uses /ticker?windowSize=X (rolling)
      * Returns an array of arrays: [['symbol' => 'BTCUSDT', 'strategy' => 'Volume Anomaly'], ...]
      */
     public function getBinanceOpportunities(
@@ -56,27 +64,45 @@ class MarketScannerService {
         int $reversalLimit = 10,
         bool $volumeEnabled = true,
         bool $earlyEnabled = true,
-        bool $reversalEnabled = true
+        bool $reversalEnabled = true,
+        float $minVolumeUsdt = 2000000,
+        float $volumeMinChange = 1.0,
+        float $volumeMaxChange = 5.0,
+        float $earlyMinChange = 5.0,
+        float $earlyMaxChange = 10.0,
+        float $reversalMinDump = -10.0,
+        float $reversalMinBounce = 2.0,
+        string $volumeWindow = '24h'
     ): array {
         try {
-            $response = Http::withoutVerifying()
-                ->timeout(15)
-                ->get("https://api.binance.com/api/v3/ticker/24hr");
+            // Choose endpoint based on window — 24h uses the dedicated (cheaper) endpoint,
+            // any other window uses the rolling-window endpoint which supports 1m → 7d.
+            if ($volumeWindow === '24h') {
+                $url      = 'https://api.binance.com/api/v3/ticker/24hr';
+                $response = Http::withoutVerifying()->timeout(15)->get($url);
+            } else {
+                // Rolling window: 1h, 4h, 12h, etc.
+                $url      = 'https://api.binance.com/api/v3/ticker';
+                $response = Http::withoutVerifying()->timeout(20)->get($url, ['windowSize' => $volumeWindow]);
+            }
 
             if (!$response->successful()) {
-                Log::warning('Failed to fetch 24h ticker from Binance');
+                Log::warning('Failed to fetch ticker from Binance', ['window' => $volumeWindow]);
                 return [];
             }
 
             $tickers = $response->json();
             
             // Filter to only active USDT pairs with solid volume
-            $validTickers = array_filter($tickers, function($t) {
+            $validTickers = array_filter($tickers, function($t) use ($minVolumeUsdt) {
                 return str_ends_with($t['symbol'], 'USDT') 
                     && !str_contains($t['symbol'], 'UPUSDT') 
                     && !str_contains($t['symbol'], 'DOWNUSDT') 
-                    && (float)$t['quoteVolume'] > 2000000; // at least 2m USDT volume
+                    && (float)$t['quoteVolume'] > $minVolumeUsdt;
             });
+
+            // Store the raw count before applying strategy filters
+            $this->lastRawCount = count($validTickers);
 
             $volumeAnomalies = [];
             $earlyMovers = [];
@@ -87,26 +113,26 @@ class MarketScannerService {
                 $lastPrice = (float)$t['lastPrice'];
                 $lowPrice = (float)$t['lowPrice'];
 
-                // Strategy 1: Volume Anomaly (Price barely moved, but huge volume)
-                if ($volumeEnabled && $change >= 1 && $change <= 5) {
+                // Strategy 1: Volume Anomaly
+                if ($volumeEnabled && $change >= $volumeMinChange && $change <= $volumeMaxChange) {
                     $volumeAnomalies[] = $t;
                 }
 
                 // Strategy 2: Early Movers (Started moving up nicely)
-                if ($earlyEnabled && $change > 5 && $change <= 10) {
+                if ($earlyEnabled && $change > $earlyMinChange && $change <= $earlyMaxChange) {
                     $earlyMovers[] = $t;
                 }
 
-                // Strategy 3: Reversal Catchers (Dumped > 10%, but bounced off the low by at least 2%)
-                if ($reversalEnabled && $change < -10) {
+                // Strategy 3: Reversal Catchers (Dumped beyond threshold, but bounced off the low)
+                if ($reversalEnabled && $change < $reversalMinDump) {
                     $bouncePercent = (($lastPrice - $lowPrice) / $lowPrice) * 100;
-                    if ($bouncePercent >= 2) {
+                    if ($bouncePercent >= $reversalMinBounce) {
                         $reversalCatchers[] = $t;
                     }
                 }
             }
 
-            // Sort them by quoteVolume descending to get the most liquid/impactful ones
+            // Sort by quoteVolume descending — most liquid first
             $sortByVolume = function($a, $b) {
                 return (float)$b['quoteVolume'] <=> (float)$a['quoteVolume'];
             };

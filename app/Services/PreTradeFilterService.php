@@ -67,7 +67,7 @@ class PreTradeFilterService
      * The actual SL value from the AI response is validated again in
      * AnalysisController::validateAndClampRecommendation() as a second defence layer.
      */
-    public function run(array $taData, array $settings = []): array
+    public function run(array $taData, array $settings = [], string $timeframe = '1h'): array
     {
         $minConfidence = (int) ($settings['pre_trade_min_confidence'] ?? self::DEFAULT_MIN_CONFIDENCE);
 
@@ -81,7 +81,8 @@ class PreTradeFilterService
         [$structureVerdict, $structureReason, $structureLog] = $this->checkMarketStructure($taData);
         $log['market_structure'] = $structureLog;
         if ($structureVerdict === 'WAIT') {
-            $warnings[] = "⚠️ Market Structure: {$structureReason}";
+            $interval = $taData['interval'] ?? 'Unknown';
+            $warnings[] = "[{$interval}] ⚠️ Market Structure: {$structureReason}";
             $verdict    = 'WAIT';
             $reason     = $structureReason;
         }
@@ -143,6 +144,35 @@ class PreTradeFilterService
             $verdict = 'WAIT';
             $reason  = $slAtrLog['reason'] ?? 'SL distance is below the 1.5× ATR minimum — stop-hunt risk.';
         }
+
+        // ── Layer 7: Sessions Filter ─────────────────────────────────────────
+        $sessionsFilterLog = ['enabled' => false];
+        if ($settings['sessions_filter_enabled'] ?? false) {
+            $allowed = array_map('strtolower', $settings['sessions_allowed'] ?? []);
+            $sessionContext = $taData['session_context'] ?? null;
+            if ($sessionContext) {
+                $active = array_map('strtolower', $sessionContext['active_sessions'] ?? []);
+                $hasAllowedActive = false;
+                foreach ($active as $act) {
+                    if (in_array($act, $allowed)) {
+                        $hasAllowedActive = true;
+                        break;
+                    }
+                }
+                $sessionsFilterLog = [
+                    'enabled' => true,
+                    'active_sessions' => $sessionContext['active_sessions'],
+                    'allowed_sessions' => $settings['sessions_allowed'] ?? [],
+                    'passed' => $hasAllowedActive,
+                ];
+                if (!$hasAllowedActive && $verdict !== 'WAIT') {
+                    $verdict = 'WAIT';
+                    $reason = "Market Session Filter: Active session (" . implode(', ', $sessionContext['active_sessions']) . ") is not allowed for trading.";
+                    $warnings[] = "🚫 Session Gate: {$reason}";
+                }
+            }
+        }
+        $log['sessions_filter'] = $sessionsFilterLog;
 
         $filterResult = [
             'pre_trade_verdict'   => $verdict,
@@ -278,6 +308,7 @@ class PreTradeFilterService
         // Classical chart patterns
         $chartPatterns = $taData['classical']['chart_patterns'] ?? [];
         foreach ($chartPatterns as $p) {
+            if (strtolower($p['status'] ?? '') === 'invalidated') continue;
             $dir = strtolower($p['direction'] ?? '');
             if ($dir === 'bullish') { $bullish++; $details[] = "Classical: {$p['name']} (bullish)"; }
             if ($dir === 'bearish') { $bearish++; $details[] = "Classical: {$p['name']} (bearish)"; }
@@ -286,6 +317,7 @@ class PreTradeFilterService
         // Harmonic patterns
         $harmonicPatterns = $taData['harmonic']['patterns'] ?? [];
         foreach ($harmonicPatterns as $p) {
+            if (strtolower($p['status'] ?? '') === 'invalidated') continue;
             $dir = strtolower($p['direction'] ?? '');
             if ($dir === 'bullish') { $bullish++; $details[] = "Harmonic: {$p['pattern']} (bullish)"; }
             if ($dir === 'bearish') { $bearish++; $details[] = "Harmonic: {$p['pattern']} (bearish)"; }
@@ -308,7 +340,8 @@ class PreTradeFilterService
         $penalty       = (int) ceil(self::PATTERN_BASE_PENALTY + ($conflictRatio * self::PATTERN_EXTRA_PENALTY));
         $penalty       = min($penalty, 20); // Hard cap at 20%
 
-        $warning = "⚠️ Pattern Conflict: {$bullish} bullish vs {$bearish} bearish pattern(s) active simultaneously. "
+        $interval = $taData['interval'] ?? 'Unknown';
+        $warning = "[{$interval}] ⚠️ Pattern Conflict: {$bullish} bullish vs {$bearish} bearish pattern(s) active simultaneously. "
                  . "Market in 'confusion' state — confidence penalised by {$penalty}%.";
 
         $log['conflict_ratio'] = round($conflictRatio, 2);
@@ -353,7 +386,8 @@ class PreTradeFilterService
         if ($divergence > self::BIAS_DIVERGENCE_WARN_AT) {
             $stronger = $classicalConfidence >= $smcConfidence ? 'Classical' : 'SMC';
             $weaker   = $stronger === 'Classical' ? 'SMC' : 'Classical';
-            $warnings[] = "⚠️ Bias Divergence: Classical={$classicalConfidence}% vs SMC={$smcConfidence}% (gap={$divergence}%). {$stronger} analysis is dominant.";
+            $interval = $taData['interval'] ?? 'Unknown';
+            $warnings[] = "[{$interval}] ⚠️ Bias Divergence: Classical={$classicalConfidence}% vs SMC={$smcConfidence}% (gap={$divergence}%). {$stronger} analysis is dominant.";
             $log['verdict'] = 'diverged_confidence';
         }
 
@@ -362,11 +396,13 @@ class PreTradeFilterService
         
         if ($structDirNorm !== 'neutral') {
             if ($classicalBias !== 'neutral' && $classicalBias !== $structDirNorm) {
-                $warnings[] = "⚠️ Structural Conflict: Market Structure is '{$structDirNorm}' but Classical Bias is '{$classicalBias}'.";
+                $interval = $taData['interval'] ?? 'Unknown';
+                $warnings[] = "[{$interval}] ⚠️ Structural Conflict: Market Structure is '{$structDirNorm}' but Classical Bias is '{$classicalBias}'.";
                 $log['verdict'] = 'diverged_structure';
             }
             if ($smcBias !== 'neutral' && $smcBias !== $structDirNorm) {
-                $warnings[] = "⚠️ Structural Conflict: Market Structure is '{$structDirNorm}' but SMC Bias is '{$smcBias}'.";
+                $interval = $taData['interval'] ?? 'Unknown';
+                $warnings[] = "[{$interval}] ⚠️ Structural Conflict: Market Structure is '{$structDirNorm}' but SMC Bias is '{$smcBias}'.";
                 $log['verdict'] = 'diverged_structure';
             }
         }
@@ -421,7 +457,8 @@ class PreTradeFilterService
 
         $log['status'] = 'conflict';
         $manipDirection = $amd['manipulation']['direction'] ?? 'sweep';
-        $warning = "⚠️ AMD Cycle Conflict: Distribution phase expected {$expectedDirection} (after a {$manipDirection}), "
+        $interval = $taData['interval'] ?? 'Unknown';
+        $warning = "[{$interval}] ⚠️ AMD Cycle Conflict: Distribution phase expected {$expectedDirection} (after a {$manipDirection}), "
                  . "but overall technical bias is {$overallBias}. Treat as a reduced-confidence setup.";
 
         return [0, $warning, $log];
@@ -483,7 +520,8 @@ class PreTradeFilterService
         if ($minSlPct > 8.0) {
             $log['status'] = 'extreme_volatility_skipped';
             $log['reason'] = "ATR is extremely high ({$minSlPct}% of price). Gate skipped to avoid false positive — ensure wide SL is used.";
-            $warning = "⚠️ ATR Gate: Extreme volatility detected — ATR = {$atr} ({$minSlPct}% of price). Minimum SL distance = \${$minSlDistance}. Ensure SL is at least 1.5× ATR.";
+            $interval = $taData['interval'] ?? 'Unknown';
+            $warning = "[{$interval}] ⚠️ ATR Gate: Extreme volatility detected — ATR = {$atr} ({$minSlPct}% of price). Minimum SL distance = \${$minSlDistance}. Ensure SL is at least 1.5× ATR.";
             return ['PROCEED', $warning, $log];
         }
 

@@ -1,5 +1,9 @@
 <?php
 
+// Raise PHP memory limit globally for all API requests.
+// The default 128M is exhausted when loading analyses with large raw_data columns.
+ini_set('memory_limit', '512M');
+
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;

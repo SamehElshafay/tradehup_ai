@@ -60,6 +60,16 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
             $revEnabled     = $settings['strategy_reversal_enabled'] ?? true;
             $revLimit       = (int) ($settings['strategy_reversal_limit'] ?? 10);
 
+            // Threshold settings (new — user-configurable)
+            $minVolumeUsdt       = (float) ($settings['strategy_min_volume_usdt']    ?? 2000000);
+            $volumeMinChange     = (float) ($settings['strategy_volume_min_change']  ?? 1.0);
+            $volumeMaxChange     = (float) ($settings['strategy_volume_max_change']  ?? 5.0);
+            $earlyMinChange      = (float) ($settings['strategy_early_min_change']   ?? 5.0);
+            $earlyMaxChange      = (float) ($settings['strategy_early_max_change']   ?? 10.0);
+            $reversalMinDump     = (float) ($settings['strategy_reversal_min_dump']  ?? -10.0);
+            $reversalMinBounce   = (float) ($settings['strategy_reversal_min_bounce'] ?? 2.0);
+            $volumeWindow        = (string) ($settings['strategy_volume_window']     ?? '24h');
+
             $activeStrategies = [];
             if ($trendEnabled) $activeStrategies[] = 'Trending';
             if ($volEnabled)   $activeStrategies[] = 'Volume Anomaly';
@@ -74,8 +84,23 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
             $trendingCoins = $trendEnabled ? $scanner->getTrendingCoins($trendLimit) : [];
             $binanceCoins  = $scanner->getBinanceOpportunities(
                 $volLimit, $earlyLimit, $revLimit,
-                $volEnabled, $earlyEnabled, $revEnabled
+                $volEnabled, $earlyEnabled, $revEnabled,
+                $minVolumeUsdt, $volumeMinChange, $volumeMaxChange,
+                $earlyMinChange, $earlyMaxChange,
+                $reversalMinDump, $reversalMinBounce,
+                $volumeWindow
             );
+
+            // Log how many raw USDT tickers were inspected before strategy filtering
+            $rawBinanceCount = $scanner->getLastRawCount();
+            if ($rawBinanceCount > 0) {
+                event(new MarketScanProgress(
+                    "Fetched {$rawBinanceCount} liquid USDT tickers from Binance [{$volumeWindow} window] before strategy filters.",
+                    'info',
+                    null, null, null, null, null, null,
+                    $rawBinanceCount
+                ));
+            }
             
             // Merge and deduplicate by symbol (preferring new strategies over 'Old')
             $merged = [];
@@ -114,7 +139,15 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
             }
             $coinsToScan = $validCoins;
 
-            event(new MarketScanProgress("Found " . count($coinsToScan) . " coins to analyze using: $strategiesStr.", 'success'));
+            // Build a simple list to broadcast: [{ symbol, strategy }, ...]
+            $coinsList = array_map(fn($c) => ['symbol' => $c['symbol'], 'strategy' => $c['strategy']], $coinsToScan);
+            event(new MarketScanProgress(
+                "Found " . count($coinsToScan) . " coins to analyze using: $strategiesStr.",
+                'success',
+                null, null, null, null, null,
+                $coinsList,
+                $rawBinanceCount
+            ));
             Log::info('Found coins to analyze', ['coins' => $coinsToScan]);
 
             $totalCoins = count($coinsToScan);
@@ -160,10 +193,15 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
                 $displayTimeframe = $timeframe;
                 if (file_exists($settingsFile)) {
                     $settings = json_decode(file_get_contents($settingsFile), true);
+                    $mtfToggleOn = (bool) ($settings['multi_timeframe'] ?? false);
                     $htfTf = $settings['mtf_htf'] ?? null;
                     $mtfTf = $settings['mtf_mtf'] ?? null;
                     $ltfTf = $settings['mtf_ltf'] ?? null;
-                    if ($htfTf && $mtfTf && $ltfTf && $htfTf !== $mtfTf && $mtfTf !== $ltfTf && $htfTf !== $ltfTf) {
+                    // Must mirror AnalysisController::analyze()'s $mtfActive condition —
+                    // the multi_timeframe toggle previously wasn't checked here either,
+                    // so the scan progress message could claim "MTF: ..." while the
+                    // toggle was off and the actual analysis ran single-timeframe.
+                    if ($mtfToggleOn && $htfTf && $mtfTf && $ltfTf && $htfTf !== $mtfTf && $mtfTf !== $ltfTf && $htfTf !== $ltfTf) {
                         $displayTimeframe = "MTF: {$htfTf}→{$mtfTf}→{$ltfTf}";
                     }
                 }
@@ -188,8 +226,43 @@ class ScanMarketOpportunitiesJob implements ShouldQueue {
                             $hasOpp = (isset($data['recommendation']) && $data['recommendation']['action'] !== 'WAIT') ? 'Yes!' : 'No';
                             $action = $data['recommendation']['action'] ?? 'WAIT';
                             $analysisId = $data['id'] ?? null; // Assuming analysis ID is returned in $data['id']
-                            
-                            event(new MarketScanProgress("Successfully analyzed {$symbol}. Found opportunity? {$hasOpp}", 'success', $symbol, $action, $analysisId, null, $strategy));
+
+                            $progressMsg = "Successfully analyzed {$symbol}. Found opportunity? {$hasOpp}";
+                            if ($action !== 'WAIT' && isset($data['recommendation'])) {
+                                $rec = $data['recommendation'];
+                                $parts = ["→ {$action}"];
+                                if (isset($rec['confidence'])) $parts[] = "{$rec['confidence']}% conf";
+                                if (!empty($rec['entry_price'])) $parts[] = "Entry: {$rec['entry_price']}";
+                                if (!empty($rec['tp1'])) $parts[] = "TP1: {$rec['tp1']}";
+                                if (!empty($rec['tp2'])) $parts[] = "TP2: {$rec['tp2']}";
+                                if (!empty($rec['tp3'])) $parts[] = "TP3: {$rec['tp3']}";
+                                if (!empty($rec['sl']))  $parts[] = "SL: {$rec['sl']}";
+                                $progressMsg .= ' | ' . implode(' | ', $parts);
+                            } elseif ($action === 'WAIT') {
+                                // "If WAIT weren't an option" — the raw Classical+SMC+Harmonic+Volume
+                                // bias is computed BEFORE the confidence-threshold gate turns it into
+                                // WAIT, so the underlying lean is already sitting in raw_data. Surface
+                                // it here as a below-threshold hint, not a real recommendation.
+                                $rawBias  = $data['analysis']['raw_data']['overall_bias'] ?? null;
+                                $rawConf  = $data['analysis']['raw_data']['overall_confidence'] ?? null;
+                                $rawPrice = (float) ($data['analysis']['raw_data']['current_price'] ?? 0);
+                                if (in_array(strtolower((string) $rawBias), ['bullish', 'bearish']) && $rawPrice > 0) {
+                                    $lean   = strtolower($rawBias) === 'bullish' ? 'BUY' : 'SELL';
+                                    $isBuy  = $lean === 'BUY';
+                                    $c      = $analyzer->getTimeframeConstraints($timeframe);
+                                    $tpStep = $rawPrice * $c['tp_step'];
+                                    $slDist = $rawPrice * $c['sl_ratio'];
+                                    $hypTp1 = $isBuy ? $rawPrice + $tpStep : $rawPrice - $tpStep;
+                                    $hypSl  = $isBuy ? $rawPrice - $slDist : $rawPrice + $slDist;
+
+                                    $progressMsg .= " | (if not WAIT, leans {$lean}" .
+                                        ($rawConf !== null ? ", {$rawConf}% raw confidence" : '') .
+                                        " — below threshold) | Entry: {$rawPrice} | TP1: " . round($hypTp1, 8) .
+                                        " | SL: " . round($hypSl, 8);
+                                }
+                            }
+
+                            event(new MarketScanProgress($progressMsg, 'success', $symbol, $action, $analysisId, null, $strategy));
                             Log::info("Successfully analyzed trending coin: {$symbol}");
                         } else {
                             $errorMsg = $data['message'] ?? $data['error'] ?? 'Unknown error';

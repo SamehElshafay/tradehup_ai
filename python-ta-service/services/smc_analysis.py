@@ -337,10 +337,19 @@ def run_smc_analysis(df: pd.DataFrame) -> dict:
             confidence = int((bearish / total) * 100)
         else:
             confidence = 50
-    
+
     # Minimum confidence floor — avoid 0%
     if total > 0 and confidence == 0:
         confidence = 50
+
+    # Cap — 100% is never statistically valid (same principle bias_combiner.py
+    # applies to overall_confidence, and classical_analysis.py applies to its own
+    # school confidence, capped at 82). This was the one school with no cap at
+    # all, capable of hitting a bare 100 whenever every SMC sub-signal agreed —
+    # the direct cause of a Bias Divergence warning that can never resolve
+    # (Classical capped at 82, SMC uncapped at 100 = a permanent 18+ point gap
+    # even on a fully one-sided read).
+    confidence = min(confidence, 90)
 
     return {
         "market_structure": structure,
