@@ -140,6 +140,8 @@ log "6. Web Server (Apache / Nginx)"
 if command -v httpd &>/dev/null || [ -d "/etc/httpd" ]; then
     echo "Apache (httpd) detected. Configuring Apache..."
     
+    mkdir -p /etc/httpd/conf.d
+    
     # Create Apache config for Laravel
     cat > /etc/httpd/conf.d/ai-trading.conf << APACHE_EOF
 <VirtualHost *:80>
