@@ -1,6 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-numpy==1.24.3
+numpy==1.26.4
 pandas==1.5.3
 git+https://github.com/MerlinR/Pandas-ta-fork.git
 requests==2.32.3
