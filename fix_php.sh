@@ -104,11 +104,23 @@ if ! systemctl is-active --quiet mariadb 2>/dev/null && ! systemctl is-active --
 fi
 
 DB_PASS=$(openssl rand -base64 20 | tr -dc 'a-zA-Z0-9' | head -c16)
-mysql -e "
+
+# Reuse existing password from .env if it exists
+if [ -f "${PROJECT_DIR}/.env" ]; then
+    EXISTING_PASS=$(grep '^DB_PASSWORD=' "${PROJECT_DIR}/.env" | cut -d '=' -f2)
+    if [ -n "$EXISTING_PASS" ]; then
+        DB_PASS="$EXISTING_PASS"
+    fi
+fi
+
+SQL_CMDS="
 CREATE DATABASE IF NOT EXISTS ai_automation_trading CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'ai_trading'@'localhost' IDENTIFIED BY '${DB_PASS}';
+ALTER USER 'ai_trading'@'localhost' IDENTIFIED BY '${DB_PASS}';
 GRANT ALL PRIVILEGES ON ai_automation_trading.* TO 'ai_trading'@'localhost';
-FLUSH PRIVILEGES;" 2>/dev/null || warn "DB might already exist — continuing"
+FLUSH PRIVILEGES;"
+
+mysql -e "$SQL_CMDS" 2>/dev/null || mysql -u root -e "$SQL_CMDS" 2>/dev/null || warn "Failed to configure database user, continuing..."
 ok "Database ready | Pass: ${DB_PASS}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -254,7 +266,9 @@ log "8. Laravel Setup"
 # ═══════════════════════════════════════════════════════════════════════════════
 cd "$PROJECT_DIR"
 
-cat > .env << ENV_EOF
+# Write .env only if it doesn't already exist
+if [ ! -f ".env" ]; then
+    cat > .env << ENV_EOF
 APP_NAME="AI Trading Platform"
 APP_ENV=production
 APP_KEY=
@@ -304,6 +318,11 @@ BINANCE_API_SECRET=
 
 FRONTEND_URL=http://${SERVER_IP}
 ENV_EOF
+else
+    # Update DB password in case it needs to sync with the database setup
+    sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=${DB_PASS}/" .env
+fi
+
 
 composer install --no-dev --optimize-autoloader --no-interaction
 $PHP_BIN artisan key:generate --force
